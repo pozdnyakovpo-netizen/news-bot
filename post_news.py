@@ -29,6 +29,7 @@ MAX_ITEMS = 5                      # максимум новостей за од
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
 FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
 AI_CALL_DELAY = 0.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит)
+SEND_DELAY = 1.5                   # сек, пауза между отправками отдельных постов (анти-флуд)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
@@ -171,18 +172,23 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f)
 
 
-# --- Перефразирование через GigaChat ---
+# --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
 def rewrite_with_ai(title, summary):
     token = get_gigachat_token()
     if not token:
         return None
     try:
-        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость живым, кратким и цепляющим языком (1–2 предложения, не больше 220 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
+        prompt = f"""Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 2 частях.
 
-Заголовок: {title}
+1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце (5–9 слов)
+2) ТЕКСТ — 1–2 предложения по существу, живым языком, без канцелярита, со всеми ключевыми фактами и цифрами
+
+Заголовок исходной новости: {title}
 Краткое содержание: {summary if summary else "нет"}
 
-Ответ (только переписанный текст, без кавычек и пояснений):"""
+Ответь строго в формате:
+ЗАГОЛОВОК: <текст>
+ТЕКСТ: <текст>"""
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -193,7 +199,7 @@ def rewrite_with_ai(title, summary):
             "model": "GigaChat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 150,
+            "max_tokens": 220,
         }
         resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
         if resp.status_code == 401:
@@ -207,9 +213,16 @@ def rewrite_with_ai(title, summary):
 
         resp.raise_for_status()
         data = resp.json()
-        text = data["choices"][0]["message"]["content"].strip()
+        answer = data["choices"][0]["message"]["content"].strip()
         time.sleep(AI_CALL_DELAY)
-        return text
+
+        headline_match = re.search(r"ЗАГОЛОВОК:\s*(.+)", answer)
+        body_match = re.search(r"ТЕКСТ:\s*(.+)", answer, re.S)
+        if headline_match and body_match:
+            headline = headline_match.group(1).strip()
+            body = body_match.group(1).strip()
+            return {"headline": headline, "body": body}
+        return None
     except Exception as e:
         print(f"[ERROR] GigaChat rewrite error: {e}")
         return None
@@ -270,10 +283,11 @@ def fetch_news():
 
             rewritten = rewrite_with_ai(title, summary)
             if rewritten:
-                text = html.escape(rewritten)
+                headline = html.escape(rewritten["headline"])
+                body = html.escape(rewritten["body"])
             else:
-                fallback = f"{title}. {summary[:200]}..." if summary else title
-                text = html.escape(fallback)
+                headline = html.escape(title[:90])
+                body = html.escape(summary[:200] + "..." if summary else title)
 
             emoji, label, hashtag = pick_category(title, summary)
             src = source_name(link)
@@ -284,7 +298,8 @@ def fetch_news():
                 "label": label,
                 "hashtag": hashtag,
                 "source": src,
-                "text": text,
+                "headline": headline,
+                "body": body,
                 "link": link,
                 "published": entry.get("published", datetime.now().isoformat())
             })
@@ -300,7 +315,7 @@ def pick_featured_index(items):
     if not token:
         return 0
     try:
-        listing = "\n".join(f"{i}. {it['text'][:150]}" for i, it in enumerate(items))
+        listing = "\n".join(f"{i}. {it['headline']} — {it['body'][:120]}" for i, it in enumerate(items))
         prompt = (
             "Ниже список новостей дайджеста, пронумерованных с 0. "
             "Выбери номер самой интересной и цепляющей новости для широкой аудитории — "
@@ -355,77 +370,26 @@ def send_to_telegram(text):
         return False
 
 
-# --- Текст одной новости внутри секции категории ---
-def format_item(item):
+# --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
+def format_post(item, extra=""):
     src_line = f" — <i>{html.escape(item['source'])}</i>" if item["source"] else ""
-    body = f"▸ {item['text']}{src_line}"
+    text = f"{item['emoji']} <b>{item['headline']}</b>\n\n{item['body']}{src_line}"
     if item["link"]:
-        body += f"\n   🔗 <a href=\"{item['link']}\">Читать полностью</a>"
-    return body
+        text += f"\n\n🔗 <a href=\"{item['link']}\">Читать полностью</a>"
+    text += f"\n\n{item['hashtag']}"
+    if extra:
+        text += f"\n\n{extra}"
+    return text
 
 
-# --- Формирование дайджеста: главная новость + группировка по категориям ---
-def build_digest_messages(items, subscriber_count=None):
-    if not items:
-        return []
-
-    featured_idx = pick_featured_index(items)
-    featured = items[featured_idx]
-    rest = [it for i, it in enumerate(items) if i != featured_idx]
-
-    # группируем остальные новости, сохраняя порядок первого появления категории
-    groups = {}
-    order = []
-    for item in rest:
-        key = (item["emoji"], item["label"])
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(item)
-
-    now = datetime.now()
-    weekday = WEEKDAYS[now.weekday()]
-    header = (
-        f"✨ <b>ДАЙДЖЕСТ НОВОСТЕЙ</b> ✨\n"
-        f"🗓 {weekday}, {now.strftime('%d.%m.%Y')} · {now.strftime('%H:%M')}\n"
-        f"{DIVIDER}\n\n"
-        f"🔥 <b>ГЛАВНОЕ</b>\n\n"
-        f"{format_item(featured)}\n\n"
-        f"{DIVIDER}\n\n"
-    )
-
-    growth_line = ""
-    if subscriber_count is not None:
-        upcoming = next((m for m in MILESTONES if m > subscriber_count), None)
-        if upcoming is not None:
-            remaining = upcoming - subscriber_count
-            growth_line = f"🎯 До {upcoming} подписчиков осталось {remaining} — приведи друга!\n"
-
-    footer = (
-        f"\n{DIVIDER}\n"
-        f"👍 Ставьте реакции, если дайджест понравился!\n"
-        f"📬 Следующий выпуск уже скоро\n"
-        f"{growth_line}"
-        f"{random.choice(CTA_VARIANTS)}"
-    )
-
-    messages = []
-    current = header
-    for key in order:
-        emoji, label = key
-        hashtag = groups[key][0]["hashtag"]
-        section = f"{emoji} <b>{label.upper()}</b> {hashtag}\n\n"
-        for item in groups[key]:
-            section += format_item(item) + "\n\n"
-
-        if len(current) + len(section) + len(footer) > 4096:
-            messages.append(current.rstrip())
-            current = ""
-        current += section
-
-    current += footer
-    messages.append(current.rstrip())
-    return messages
+def build_growth_line(subscriber_count):
+    if subscriber_count is None:
+        return ""
+    upcoming = next((m for m in MILESTONES if m > subscriber_count), None)
+    if upcoming is None:
+        return ""
+    remaining = upcoming - subscriber_count
+    return f"🎯 До {upcoming} подписчиков осталось {remaining} — приведи друга!\n"
 
 
 # --- Умное самопродвижение: авто-поздравление с вехами подписчиков ---
@@ -508,23 +472,33 @@ def main():
         print("[INFO] No new news.")
         return
 
-    messages = build_digest_messages(news, count)
+    # самую интересную новость ставим первой
+    featured_idx = pick_featured_index(news)
+    if featured_idx != 0:
+        news.insert(0, news.pop(featured_idx))
 
-    all_ok = True
-    for msg in messages:
-        ok = send_to_telegram(msg)
-        if not ok:
-            all_ok = False
+    growth_line = build_growth_line(count)
+
+    posted = load_posted()
+    sent_count = 0
+    for i, item in enumerate(news):
+        is_last = (i == len(news) - 1)
+        extra = f"{growth_line}{random.choice(CTA_VARIANTS)}" if is_last else ""
+        text = format_post(item, extra=extra)
+
+        ok = send_to_telegram(text)
+        if ok:
+            # помечаем как отправленное СРАЗУ — если следующий пост не уйдёт,
+            # уже опубликованные не задвоятся при повторном запуске
+            posted.add(item["id"])
+            save_posted(posted)
+            sent_count += 1
+            time.sleep(SEND_DELAY)
+        else:
+            print(f"[WARN] Failed to send item {item['id']} — will retry next run.")
             break
 
-    if all_ok:
-        posted = load_posted()
-        for item in news:
-            posted.add(item["id"])
-        save_posted(posted)
-        print(f"[DONE] Sent {len(news)} items in {len(messages)} message(s).")
-    else:
-        print("[WARN] Send failed — items NOT marked as posted, will retry next run.")
+    print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
 
 
 if __name__ == "__main__":
