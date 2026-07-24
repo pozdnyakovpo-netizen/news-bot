@@ -2,10 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import json
+import time
+import html
 import feedparser
 import requests
-import time
+from urllib.parse import urlparse
 from datetime import datetime
 from anthropic import Anthropic, APIError, RateLimitError
 
@@ -15,7 +18,47 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
 POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
-MAX_ITEMS = 5                      # максимум новостей за один запуск
+MAX_ITEMS = 5                      # максимум новостей за один запуск (глобально)
+FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
+FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
+AI_CALL_DELAY = 0.5                # сек, пауза между вызовами Claude (анти-рейтлимит)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
+}
+
+# Эмодзи по категориям — определяем по ключевым словам в заголовке/домене.
+# Порядок важен: первое совпадение побеждает.
+CATEGORY_RULES = [
+    (["спорт", "футбол", "хоккей", "олимпиад", "чемпионат"], "⚽"),
+    (["экономик", "рубл", "доллар", "нефт", "банк", "рынок", "инфляц"], "💰"),
+    (["технолог", "ии ", "искусственн", "робот", "гаджет", "смартфон"], "💻"),
+    (["наука", "учен", "исследован", "космос", "открыт"], "🔬"),
+    (["погод", "климат", "ураган", "снег", "морож"], "🌦"),
+    (["здоровь", "медицин", "врач", "болезн", "вирус"], "🩺"),
+    (["политик", "президент", "правительств", "министр", "закон"], "🏛"),
+    (["происшеств", "авари", "пожар", "взрыв", "трагед"], "🚨"),
+    (["культур", "кино", "музык", "театр", "выставк"], "🎭"),
+]
+DEFAULT_EMOJI = "📰"
+
+
+def pick_emoji(title):
+    t = title.lower()
+    for keywords, emoji in CATEGORY_RULES:
+        if any(kw in t for kw in keywords):
+            return emoji
+    return DEFAULT_EMOJI
+
+
+def source_name(link):
+    try:
+        domain = urlparse(link).netloc
+        domain = domain.replace("www.", "")
+        return domain
+    except Exception:
+        return ""
+
 
 # --- Инициализация Claude ---
 claude = None
@@ -28,6 +71,7 @@ if ANTHROPIC_API_KEY:
 else:
     print("[WARN] ANTHROPIC_API_KEY not set, AI rewriting disabled.")
 
+
 # --- Загрузка уже отправленных ID ---
 def load_posted():
     if os.path.exists(POSTED_FILE):
@@ -35,29 +79,31 @@ def load_posted():
             return set(json.load(f))
     return set()
 
+
 def save_posted(posted_set):
     with open(POSTED_FILE, "w") as f:
         json.dump(list(posted_set), f)
+
 
 # --- Перефразирование через Claude ---
 def rewrite_with_ai(title, summary):
     if not claude:
         return None
     try:
-        prompt = f"""
-Ты — редактор новостного дайджеста. Перепиши следующую новость в кратком, живом, фактологическом стиле (1–2 предложения). Сохрани все ключевые факты, но убери канцелярит и воду.
+        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость living, кратким и цепляющим языком (1–2 предложения, не больше 250 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
 
 Заголовок: {title}
 Краткое содержание: {summary if summary else "нет"}
 
 Ответ (только переписанный текст, без кавычек и пояснений):"""
-        
+
         response = claude.messages.create(
-            model="claude-3-haiku-20240307",  # дешёвая и быстрая модель
+            model="claude-3-haiku-20240307",
             max_tokens=150,
             temperature=0.7,
             messages=[{"role": "user", "content": prompt}]
         )
+        time.sleep(AI_CALL_DELAY)  # небольшая пауза, чтобы не упереться в rate limit
         return response.content[0].text.strip()
     except RateLimitError:
         print("[ERROR] Claude rate limit reached.")
@@ -69,11 +115,31 @@ def rewrite_with_ai(title, summary):
         print(f"[ERROR] Unexpected AI error: {e}")
         return None
 
+
+# --- Загрузка одного RSS с ретраями ---
+def fetch_feed_with_retry(url):
+    last_error = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            if feed.bozo and not feed.entries:
+                raise ValueError(f"bozo parse error: {feed.bozo_exception}")
+            return feed
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] Attempt {attempt}/{FETCH_RETRIES} failed for {url}: {e}")
+            if attempt < FETCH_RETRIES:
+                time.sleep(2 * attempt)  # backoff: 2s, 4s...
+    print(f"[ERROR] Failed to parse {url} after {FETCH_RETRIES} attempts: {last_error}")
+    return None
+
+
 # --- Основной сбор ---
 def fetch_news():
     posted = load_posted()
     new_items = []
-    feed_urls = []
 
     if not os.path.exists(FEEDS_FILE):
         print("[ERROR] feeds.txt not found!")
@@ -83,46 +149,47 @@ def fetch_news():
         feed_urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
     for url in feed_urls:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:MAX_ITEMS]:  # берём не больше лимита с каждого
-                entry_id = entry.get("id") or entry.get("link")
-                if not entry_id:
-                    continue
-                if entry_id in posted:
-                    continue
+        if len(new_items) >= MAX_ITEMS:
+            break  # глобальный лимит достигнут — прекращаем сбор со всех фидов
 
-                title = entry.get("title", "Без заголовка")
-                summary = entry.get("summary", entry.get("description", ""))
-                # Убираем HTML-теги из summary
-                import re
-                summary = re.sub(r"<[^>]+>", "", summary)
-                link = entry.get("link", "")
+        feed = fetch_feed_with_retry(url)
+        if feed is None:
+            continue
 
-                # Перефразируем
-                rewritten = rewrite_with_ai(title, summary)
-                if rewritten:
-                    text = rewritten
-                else:
-                    # Fallback: используем заголовок + краткий отрывок
-                    text = f"{title}. {summary[:200]}..." if summary else title
+        for entry in feed.entries:
+            if len(new_items) >= MAX_ITEMS:
+                break  # глобальный лимит — выходим из внутреннего цикла тоже
 
-                # Добавляем ссылку, если есть
-                if link:
-                    text += f"\n\n🔗 {link}"
+            entry_id = entry.get("id") or entry.get("link")
+            if not entry_id or entry_id in posted:
+                continue
 
-                new_items.append({
-                    "id": entry_id,
-                    "text": text,
-                    "published": entry.get("published", datetime.now().isoformat())
-                })
+            title = entry.get("title", "Без заголовка")
+            summary = entry.get("summary", entry.get("description", ""))
+            summary = re.sub(r"<[^>]+>", "", summary)  # убираем HTML-теги
+            link = entry.get("link", "")
 
-                if len(new_items) >= MAX_ITEMS:
-                    break
-        except Exception as e:
-            print(f"[ERROR] Failed to parse {url}: {e}")
+            rewritten = rewrite_with_ai(title, summary)
+            if rewritten:
+                text = html.escape(rewritten)
+            else:
+                fallback = f"{title}. {summary[:200]}..." if summary else title
+                text = html.escape(fallback)
+
+            emoji = pick_emoji(title)
+            src = source_name(link)
+
+            new_items.append({
+                "id": entry_id,
+                "emoji": emoji,
+                "source": src,
+                "text": text,
+                "link": link,
+                "published": entry.get("published", datetime.now().isoformat())
+            })
 
     return new_items
+
 
 # --- Отправка в Telegram ---
 def send_to_telegram(text):
@@ -147,43 +214,67 @@ def send_to_telegram(text):
         print(f"[ERROR] Telegram request error: {e}")
         return False
 
-# --- Формирование дайджеста ---
-def format_digest(items):
+
+# --- Формирование текста одной новости ---
+def format_item(item):
+    src_line = f" · <i>{html.escape(item['source'])}</i>" if item["source"] else ""
+    body = f"{item['emoji']} {item['text']}{src_line}"
+    if item["link"]:
+        body += f"\n🔗 <a href=\"{item['link']}\">Читать полностью</a>"
+    return body
+
+
+# --- Формирование дайджеста (с разбивкой по элементам, а не по символам) ---
+def build_digest_messages(items):
     if not items:
-        return None
-    header = f"📅 <b>Факт дня – {datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
-    body = ""
-    for i, item in enumerate(items, 1):
-        body += f"{i}. {item['text']}\n\n"
-    footer = "\n👍 Если понравился дайджест — ставьте реакции!"
-    return header + body + footer
+        return []
+
+    header = f"📅 <b>Дайджест новостей — {datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
+    footer = "\n👍 Ставьте реакции, если дайджест понравился!"
+
+    messages = []
+    current = header
+    for item in items:
+        block = format_item(item) + "\n\n"
+        # если добавление блока превысит лимит Telegram — закрываем текущее сообщение
+        if len(current) + len(block) + len(footer) > 4096:
+            messages.append(current.rstrip())
+            current = ""
+        current += block
+
+    current += footer
+    messages.append(current.rstrip())
+    return messages
+
 
 # --- Главная ---
 def main():
     print(f"[START] {datetime.now().isoformat()}")
     news = fetch_news()
     if not news:
-        print("No new news.")
+        print("[INFO] No new news.")
         return
 
-    digest = format_digest(news)
-    if not digest:
-        return
+    messages = build_digest_messages(news)
 
-    # Отправляем одной большой порцией (Telegram лимит 4096 символов)
-    if len(digest) > 4096:
-        # разбиваем по частям, но в нашем случае обычно меньше
-        for i in range(0, len(digest), 4096):
-            send_to_telegram(digest[i:i+4096])
+    sent_ids = []
+    all_ok = True
+    for msg in messages:
+        ok = send_to_telegram(msg)
+        if not ok:
+            all_ok = False
+            break  # не продолжаем, если Telegram недоступен
+
+    if all_ok:
+        # помечаем как отправленные ТОЛЬКО если реально ушло в Telegram
+        posted = load_posted()
+        for item in news:
+            posted.add(item["id"])
+        save_posted(posted)
+        print(f"[DONE] Sent {len(news)} items in {len(messages)} message(s).")
     else:
-        send_to_telegram(digest)
+        print("[WARN] Send failed — items NOT marked as posted, will retry next run.")
 
-    # Обновляем список отправленных
-    posted = load_posted()
-    for item in news:
-        posted.add(item["id"])
-    save_posted(posted)
-    print(f"[DONE] Sent {len(news)} items.")
 
 if __name__ == "__main__":
     main()
