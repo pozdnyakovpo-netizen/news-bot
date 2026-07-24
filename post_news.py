@@ -7,6 +7,7 @@ import json
 import time
 import html
 import uuid
+import random
 import feedparser
 import requests
 import urllib3
@@ -38,41 +39,42 @@ HEADERS = {
 CATEGORY_RULES = [
     (["спорт", "футбол", "хоккей", "олимпиад", "чемпионат", "матч", "турнир",
       "сборная", "тренер", "гол ", "теннис", "баскетбол", "волейбол", "марафон"],
-     "⚽", "Спорт"),
+     "⚽", "Спорт", "#спорт"),
     (["экономик", "рубл", "доллар", "евро", "нефт", "банк", "рынок", "инфляц",
       "бюджет", "актив", "приватиз", "компани", "завод", "бизнес", "инвестиц",
       "налог", "цена", "товар", "экспорт", "импорт", "производств", "бренд",
       "предприяти", "прибыл", "убыт", "акци", "биржа"],
-     "💰", "Экономика"),
+     "💰", "Экономика", "#экономика"),
     (["технолог", "ии ", "искусственн", "робот", "гаджет", "смартфон",
       "интернет", "приложени", "разработ", "стартап", "программ", "цифров",
       "нейросет", "чип", "процессор", "софт", "гейминг", "видеоигр"],
-     "💻", "Технологии"),
+     "💻", "Технологии", "#технологии"),
     (["наука", "учен", "исследован", "космос", "открыт", "эксперимент",
       "лаборатор", "генетик", "вселенн", "спутник", "ракет", "археолог"],
-     "🔬", "Наука"),
+     "🔬", "Наука", "#наука"),
     (["погод", "климат", "ураган", "снег", "морож", "дожд", "жара",
       "гроза", "шторм", "потепл", "заморозк"],
-     "🌦", "Погода"),
+     "🌦", "Погода", "#погода"),
     (["здоровь", "медицин", "врач", "болезн", "вирус", "больниц", "вакцин",
       "эпидеми", "пациент", "лечени", "препарат", "клиник"],
-     "🩺", "Здоровье"),
+     "🩺", "Здоровье", "#здоровье"),
     (["политик", "президент", "правительств", "министр", "закон", "госдум",
       "депутат", "указ", "санкц", "переговор", "парламент", "выбор", "чиновник"],
-     "🏛", "Политика"),
+     "🏛", "Политика", "#политика"),
     (["происшеств", "авари", "пожар", "взрыв", "трагед", "погиб", "пострада",
       "дтп", "эвакуац", "преступлен", "ограничил", "чрезвычайн", "разыскива",
       "задержан", "суд ", "уголовн"],
-     "🚨", "Происшествия"),
+     "🚨", "Происшествия", "#происшествия"),
     (["культур", "кино", "музык", "театр", "выставк", "концерт", "фестивал",
       "книга", "актер", "актрис", "режиссер", "премьер"],
-     "🎭", "Культура"),
+     "🎭", "Культура", "#культура"),
     (["аэропорт", "рейс", "самолет", "поезд", "автомоб", "дорог", "метро",
       "трасс", "маршрут", "перевозк", "транспорт", "вокзал"],
-     "🚗", "Транспорт"),
+     "🚗", "Транспорт", "#транспорт"),
 ]
 DEFAULT_EMOJI = "📰"
 DEFAULT_LABEL = "Разное"
+DEFAULT_HASHTAG = "#новости"
 
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
@@ -87,13 +89,24 @@ SHARE_URL = (
     + quote("Нашёл крутой новостной канал — залетай 👇", safe="")
 )
 
+# Разные формулировки призыва поделиться — чтобы не приедалось при частой публикации
+CTA_VARIANTS = [
+    f"🚀 <a href=\"{SHARE_URL}\">Поделиться каналом с друзьями</a>",
+    f"📣 <a href=\"{SHARE_URL}\">Расскажи друзьям про канал</a>",
+    f"✉️ <a href=\"{SHARE_URL}\">Отправить другу</a>",
+    f"🔥 <a href=\"{SHARE_URL}\">Знаешь, кому это будет интересно? Поделись</a>",
+]
+
+MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
+MILESTONES_FILE = "milestones.json"
+
 
 def pick_category(title, summary=""):
     t = (title + " " + summary).lower()
-    for keywords, emoji, label in CATEGORY_RULES:
+    for keywords, emoji, label, hashtag in CATEGORY_RULES:
         if any(kw in t for kw in keywords):
-            return emoji, label
-    return DEFAULT_EMOJI, DEFAULT_LABEL
+            return emoji, label, hashtag
+    return DEFAULT_EMOJI, DEFAULT_LABEL, DEFAULT_HASHTAG
 
 
 def source_name(link):
@@ -262,13 +275,14 @@ def fetch_news():
                 fallback = f"{title}. {summary[:200]}..." if summary else title
                 text = html.escape(fallback)
 
-            emoji, label = pick_category(title, summary)
+            emoji, label, hashtag = pick_category(title, summary)
             src = source_name(link)
 
             new_items.append({
                 "id": entry_id,
                 "emoji": emoji,
                 "label": label,
+                "hashtag": hashtag,
                 "source": src,
                 "text": text,
                 "link": link,
@@ -337,14 +351,15 @@ def build_digest_messages(items):
         f"\n{DIVIDER}\n"
         f"👍 Ставьте реакции, если дайджест понравился!\n"
         f"📬 Следующий выпуск уже скоро\n"
-        f"🚀 <a href=\"{SHARE_URL}\">Поделиться каналом с друзьями</a>"
+        f"{random.choice(CTA_VARIANTS)}"
     )
 
     messages = []
     current = header
     for key in order:
         emoji, label = key
-        section = f"{emoji} <b>{label.upper()}</b>\n\n"
+        hashtag = groups[key][0]["hashtag"]
+        section = f"{emoji} <b>{label.upper()}</b> {hashtag}\n\n"
         for item in groups[key]:
             section += format_item(item) + "\n\n"
 
@@ -358,9 +373,61 @@ def build_digest_messages(items):
     return messages
 
 
+# --- Умное самопродвижение: авто-поздравление с вехами подписчиков ---
+def get_subscriber_count():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getChatMemberCount"
+    try:
+        resp = requests.get(url, params={"chat_id": CHAT_ID}, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            return data["result"]
+        print(f"[WARN] getChatMemberCount failed: {data}")
+        return None
+    except Exception as e:
+        print(f"[WARN] getChatMemberCount error: {e}")
+        return None
+
+
+def load_last_milestone():
+    if os.path.exists(MILESTONES_FILE):
+        with open(MILESTONES_FILE, "r") as f:
+            return json.load(f).get("last", 0)
+    return 0
+
+
+def save_last_milestone(value):
+    with open(MILESTONES_FILE, "w") as f:
+        json.dump({"last": value}, f)
+
+
+def maybe_celebrate_milestone():
+    count = get_subscriber_count()
+    if count is None:
+        return
+    last = load_last_milestone()
+    crossed = [m for m in MILESTONES if last < m <= count]
+    if not crossed:
+        return
+    new_milestone = max(crossed)
+    text = (
+        f"🎉 <b>Нас уже {count}!</b>\n\n"
+        f"Спасибо, что читаете — канал растёт благодаря вам.\n"
+        f"Если ещё не поделились с друзьями — самое время 👇\n\n"
+        f"{random.choice(CTA_VARIANTS)}"
+    )
+    if send_to_telegram(text):
+        save_last_milestone(new_milestone)
+        print(f"[INFO] Milestone celebrated: {new_milestone} subscribers.")
+
+
 # --- Главная ---
 def main():
     print(f"[START] {datetime.now().isoformat()}")
+
+    maybe_celebrate_milestone()  # проверяем веху подписчиков в любом случае
+
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
