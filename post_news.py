@@ -33,28 +33,33 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
 }
 
-# Эмодзи по категориям — определяем по ключевым словам в заголовке/домене.
+# Эмодзи и русские названия категорий — определяем по ключевым словам в заголовке.
 # Порядок важен: первое совпадение побеждает.
 CATEGORY_RULES = [
-    (["спорт", "футбол", "хоккей", "олимпиад", "чемпионат"], "⚽"),
-    (["экономик", "рубл", "доллар", "нефт", "банк", "рынок", "инфляц"], "💰"),
-    (["технолог", "ии ", "искусственн", "робот", "гаджет", "смартфон"], "💻"),
-    (["наука", "учен", "исследован", "космос", "открыт"], "🔬"),
-    (["погод", "климат", "ураган", "снег", "морож"], "🌦"),
-    (["здоровь", "медицин", "врач", "болезн", "вирус"], "🩺"),
-    (["политик", "президент", "правительств", "министр", "закон"], "🏛"),
-    (["происшеств", "авари", "пожар", "взрыв", "трагед"], "🚨"),
-    (["культур", "кино", "музык", "театр", "выставк"], "🎭"),
+    (["спорт", "футбол", "хоккей", "олимпиад", "чемпионат"], "⚽", "Спорт"),
+    (["экономик", "рубл", "доллар", "нефт", "банк", "рынок", "инфляц"], "💰", "Экономика"),
+    (["технолог", "ии ", "искусственн", "робот", "гаджет", "смартфон"], "💻", "Технологии"),
+    (["наука", "учен", "исследован", "космос", "открыт"], "🔬", "Наука"),
+    (["погод", "климат", "ураган", "снег", "морож"], "🌦", "Погода"),
+    (["здоровь", "медицин", "врач", "болезн", "вирус"], "🩺", "Здоровье"),
+    (["политик", "президент", "правительств", "министр", "закон"], "🏛", "Политика"),
+    (["происшеств", "авари", "пожар", "взрыв", "трагед"], "🚨", "Происшествия"),
+    (["культур", "кино", "музык", "театр", "выставк"], "🎭", "Культура"),
 ]
 DEFAULT_EMOJI = "📰"
+DEFAULT_LABEL = "Разное"
+
+WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+
+DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
 
-def pick_emoji(title):
+def pick_category(title):
     t = title.lower()
-    for keywords, emoji in CATEGORY_RULES:
+    for keywords, emoji, label in CATEGORY_RULES:
         if any(kw in t for kw in keywords):
-            return emoji
-    return DEFAULT_EMOJI
+            return emoji, label
+    return DEFAULT_EMOJI, DEFAULT_LABEL
 
 
 def source_name(link):
@@ -88,12 +93,10 @@ def get_gigachat_token():
     try:
         # verify=False: GigaChat использует сертификат УЦ Минцифры, которого нет
         # в стандартном наборе доверенных сертификатов на большинстве серверов/раннеров.
-        # Для продакшена лучше установить сертификат Минцифры и использовать verify=<путь к .pem>.
         resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=15)
         resp.raise_for_status()
         payload = resp.json()
         _gigachat_token = payload["access_token"]
-        # expires_at приходит в миллисекундах unix-времени
         _gigachat_token_expires_at = payload["expires_at"] / 1000
         print("[INFO] GigaChat token obtained.")
         return _gigachat_token
@@ -103,7 +106,6 @@ def get_gigachat_token():
 
 
 if GIGACHAT_AUTH_KEY:
-    # Пробуем получить токен один раз при старте, чтобы сразу увидеть проблему в логах
     get_gigachat_token()
 else:
     print("[WARN] GIGACHAT_AUTH_KEY not set, AI rewriting disabled.")
@@ -128,7 +130,7 @@ def rewrite_with_ai(title, summary):
     if not token:
         return None
     try:
-        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость живым, кратким и цепляющим языком (1–2 предложения, не больше 250 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
+        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость живым, кратким и цепляющим языком (1–2 предложения, не больше 220 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
 
 Заголовок: {title}
 Краткое содержание: {summary if summary else "нет"}
@@ -148,7 +150,6 @@ def rewrite_with_ai(title, summary):
         }
         resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
         if resp.status_code == 401:
-            # токен мог протухнуть раньше времени — обновляем и пробуем один раз ещё
             global _gigachat_token
             _gigachat_token = None
             token = get_gigachat_token()
@@ -160,7 +161,7 @@ def rewrite_with_ai(title, summary):
         resp.raise_for_status()
         data = resp.json()
         text = data["choices"][0]["message"]["content"].strip()
-        time.sleep(AI_CALL_DELAY)  # небольшая пауза между вызовами
+        time.sleep(AI_CALL_DELAY)
         return text
     except Exception as e:
         print(f"[ERROR] GigaChat rewrite error: {e}")
@@ -182,7 +183,7 @@ def fetch_feed_with_retry(url):
             last_error = e
             print(f"[WARN] Attempt {attempt}/{FETCH_RETRIES} failed for {url}: {e}")
             if attempt < FETCH_RETRIES:
-                time.sleep(2 * attempt)  # backoff: 2s, 4s...
+                time.sleep(2 * attempt)
     print(f"[ERROR] Failed to parse {url} after {FETCH_RETRIES} attempts: {last_error}")
     return None
 
@@ -201,7 +202,7 @@ def fetch_news():
 
     for url in feed_urls:
         if len(new_items) >= MAX_ITEMS:
-            break  # глобальный лимит достигнут — прекращаем сбор со всех фидов
+            break
 
         feed = fetch_feed_with_retry(url)
         if feed is None:
@@ -209,7 +210,7 @@ def fetch_news():
 
         for entry in feed.entries:
             if len(new_items) >= MAX_ITEMS:
-                break  # глобальный лимит — выходим из внутреннего цикла тоже
+                break
 
             entry_id = entry.get("id") or entry.get("link")
             if not entry_id or entry_id in posted:
@@ -217,7 +218,7 @@ def fetch_news():
 
             title = entry.get("title", "Без заголовка")
             summary = entry.get("summary", entry.get("description", ""))
-            summary = re.sub(r"<[^>]+>", "", summary)  # убираем HTML-теги
+            summary = re.sub(r"<[^>]+>", "", summary)
             link = entry.get("link", "")
 
             rewritten = rewrite_with_ai(title, summary)
@@ -227,12 +228,13 @@ def fetch_news():
                 fallback = f"{title}. {summary[:200]}..." if summary else title
                 text = html.escape(fallback)
 
-            emoji = pick_emoji(title)
+            emoji, label = pick_category(title)
             src = source_name(link)
 
             new_items.append({
                 "id": entry_id,
                 "emoji": emoji,
+                "label": label,
                 "source": src,
                 "text": text,
                 "link": link,
@@ -266,32 +268,54 @@ def send_to_telegram(text):
         return False
 
 
-# --- Формирование текста одной новости ---
+# --- Текст одной новости внутри секции категории ---
 def format_item(item):
-    src_line = f" · <i>{html.escape(item['source'])}</i>" if item["source"] else ""
-    body = f"{item['emoji']} {item['text']}{src_line}"
+    src_line = f" — <i>{html.escape(item['source'])}</i>" if item["source"] else ""
+    body = f"▸ {item['text']}{src_line}"
     if item["link"]:
-        body += f"\n🔗 <a href=\"{item['link']}\">Читать полностью</a>"
+        body += f"\n   🔗 <a href=\"{item['link']}\">Читать полностью</a>"
     return body
 
 
-# --- Формирование дайджеста (с разбивкой по элементам, а не по символам) ---
+# --- Формирование дайджеста: группировка по категориям, разбивка по лимиту Telegram ---
 def build_digest_messages(items):
     if not items:
         return []
 
-    header = f"📅 <b>Дайджест новостей — {datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
-    footer = "\n👍 Ставьте реакции, если дайджест понравился!"
+    groups = {}
+    order = []
+    for item in items:
+        key = (item["emoji"], item["label"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+
+    now = datetime.now()
+    weekday = WEEKDAYS[now.weekday()]
+    header = (
+        f"✨ <b>ДАЙДЖЕСТ НОВОСТЕЙ</b> ✨\n"
+        f"🗓 {weekday}, {now.strftime('%d.%m.%Y')} · {now.strftime('%H:%M')}\n"
+        f"{DIVIDER}\n\n"
+    )
+    footer = (
+        f"\n{DIVIDER}\n"
+        f"👍 Ставьте реакции, если дайджест понравился!\n"
+        f"📬 Следующий выпуск уже скоро"
+    )
 
     messages = []
     current = header
-    for item in items:
-        block = format_item(item) + "\n\n"
-        # если добавление блока превысит лимит Telegram — закрываем текущее сообщение
-        if len(current) + len(block) + len(footer) > 4096:
+    for key in order:
+        emoji, label = key
+        section = f"{emoji} <b>{label.upper()}</b>\n\n"
+        for item in groups[key]:
+            section += format_item(item) + "\n\n"
+
+        if len(current) + len(section) + len(footer) > 4096:
             messages.append(current.rstrip())
             current = ""
-        current += block
+        current += section
 
     current += footer
     messages.append(current.rstrip())
@@ -313,10 +337,9 @@ def main():
         ok = send_to_telegram(msg)
         if not ok:
             all_ok = False
-            break  # не продолжаем, если Telegram недоступен
+            break
 
     if all_ok:
-        # помечаем как отправленные ТОЛЬКО если реально ушло в Telegram
         posted = load_posted()
         for item in news:
             posted.add(item["id"])
