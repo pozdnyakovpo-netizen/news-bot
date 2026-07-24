@@ -10,7 +10,7 @@ import uuid
 import feedparser
 import requests
 import urllib3
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from datetime import datetime
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,6 +77,15 @@ DEFAULT_LABEL = "Разное"
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
 DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+CHANNEL_USERNAME = "deepdailyfact"
+CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
+SHARE_URL = (
+    "https://t.me/share/url?url="
+    + quote(CHANNEL_LINK, safe="")
+    + "&text="
+    + quote("Нашёл крутой новостной канал — залетай 👇", safe="")
+)
 
 
 def pick_category(title, summary=""):
@@ -327,7 +336,8 @@ def build_digest_messages(items):
     footer = (
         f"\n{DIVIDER}\n"
         f"👍 Ставьте реакции, если дайджест понравился!\n"
-        f"📬 Следующий выпуск уже скоро"
+        f"📬 Следующий выпуск уже скоро\n"
+        f"🚀 <a href=\"{SHARE_URL}\">Поделиться каналом с друзьями</a>"
     )
 
     messages = []
