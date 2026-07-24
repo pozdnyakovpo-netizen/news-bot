@@ -1,0 +1,4 @@
+https://tass.ru/rss/v2.xml
+https://ria.ru/export/rss2/archive/index.xml
+https://www.interfax.ru/rss.asp
+https://rssexport.rbc.ru/rbcnews/news/30/full.rss
