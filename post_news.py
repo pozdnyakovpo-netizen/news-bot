@@ -6,22 +6,28 @@ import re
 import json
 import time
 import html
+import uuid
 import feedparser
 import requests
+import urllib3
 from urllib.parse import urlparse
 from datetime import datetime
-from anthropic import Anthropic, APIError, RateLimitError
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Настройки ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")  # "Ключ авторизации" из личного кабинета Sber
+GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
 POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
 MAX_ITEMS = 5                      # максимум новостей за один запуск (глобально)
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
 FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
-AI_CALL_DELAY = 0.5                # сек, пауза между вызовами Claude (анти-рейтлимит)
+AI_CALL_DELAY = 0.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
@@ -60,16 +66,47 @@ def source_name(link):
         return ""
 
 
-# --- Инициализация Claude ---
-claude = None
-if ANTHROPIC_API_KEY:
+# --- Инициализация GigaChat (получение access_token по OAuth) ---
+_gigachat_token = None
+_gigachat_token_expires_at = 0  # unix-время истечения токена
+
+def get_gigachat_token():
+    """Получает (и кэширует) access_token GigaChat. Токен живёт ~30 минут."""
+    global _gigachat_token, _gigachat_token_expires_at
+    if not GIGACHAT_AUTH_KEY:
+        return None
+    if _gigachat_token and time.time() < _gigachat_token_expires_at - 60:
+        return _gigachat_token  # ещё не истёк — используем кэш
+
+    headers = {
+        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+        "RqUID": str(uuid.uuid4()),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    data = {"scope": GIGACHAT_SCOPE}
     try:
-        claude = Anthropic(api_key=ANTHROPIC_API_KEY)
-        print("[INFO] Claude client initialized.")
+        # verify=False: GigaChat использует сертификат УЦ Минцифры, которого нет
+        # в стандартном наборе доверенных сертификатов на большинстве серверов/раннеров.
+        # Для продакшена лучше установить сертификат Минцифры и использовать verify=<путь к .pem>.
+        resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        _gigachat_token = payload["access_token"]
+        # expires_at приходит в миллисекундах unix-времени
+        _gigachat_token_expires_at = payload["expires_at"] / 1000
+        print("[INFO] GigaChat token obtained.")
+        return _gigachat_token
     except Exception as e:
-        print(f"[WARN] Could not init Claude: {e}")
+        print(f"[WARN] Could not obtain GigaChat token: {e}")
+        return None
+
+
+if GIGACHAT_AUTH_KEY:
+    # Пробуем получить токен один раз при старте, чтобы сразу увидеть проблему в логах
+    get_gigachat_token()
 else:
-    print("[WARN] ANTHROPIC_API_KEY not set, AI rewriting disabled.")
+    print("[WARN] GIGACHAT_AUTH_KEY not set, AI rewriting disabled.")
 
 
 # --- Загрузка уже отправленных ID ---
@@ -85,34 +122,48 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f)
 
 
-# --- Перефразирование через Claude ---
+# --- Перефразирование через GigaChat ---
 def rewrite_with_ai(title, summary):
-    if not claude:
+    token = get_gigachat_token()
+    if not token:
         return None
     try:
-        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость living, кратким и цепляющим языком (1–2 предложения, не больше 250 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
+        prompt = f"""Ты — редактор новостного дайджеста для Telegram-канала. Перепиши следующую новость живым, кратким и цепляющим языком (1–2 предложения, не больше 250 символов). Сохрани все ключевые факты, убери канцелярит и воду. Пиши так, чтобы хотелось дочитать.
 
 Заголовок: {title}
 Краткое содержание: {summary if summary else "нет"}
 
 Ответ (только переписанный текст, без кавычек и пояснений):"""
 
-        response = claude.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=150,
-            temperature=0.7,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        time.sleep(AI_CALL_DELAY)  # небольшая пауза, чтобы не упереться в rate limit
-        return response.content[0].text.strip()
-    except RateLimitError:
-        print("[ERROR] Claude rate limit reached.")
-        return None
-    except APIError as e:
-        print(f"[ERROR] Claude API error: {e}")
-        return None
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 150,
+        }
+        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
+        if resp.status_code == 401:
+            # токен мог протухнуть раньше времени — обновляем и пробуем один раз ещё
+            global _gigachat_token
+            _gigachat_token = None
+            token = get_gigachat_token()
+            if not token:
+                return None
+            headers["Authorization"] = f"Bearer {token}"
+            resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
+
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        time.sleep(AI_CALL_DELAY)  # небольшая пауза между вызовами
+        return text
     except Exception as e:
-        print(f"[ERROR] Unexpected AI error: {e}")
+        print(f"[ERROR] GigaChat rewrite error: {e}")
         return None
 
 
@@ -257,7 +308,6 @@ def main():
 
     messages = build_digest_messages(news)
 
-    sent_ids = []
     all_ok = True
     for msg in messages:
         ok = send_to_telegram(msg)
