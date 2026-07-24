@@ -2,3 +2,16 @@ https://tass.ru/rss/v2.xml
 https://ria.ru/export/rss2/archive/index.xml
 https://www.interfax.ru/rss.asp
 https://rssexport.rbc.ru/rbcnews/news/30/full.rss
+https://lenta.ru/rss
+https://iz.ru/xml/rss/all.xml
+https://www.gazeta.ru/export/rss/lenta.xml
+https://www.kommersant.ru/RSS/news.xml
+https://www.vedomosti.ru/rss/news
+https://russian.rt.com/rss
+https://tvzvezda.ru/rss/index.xml
+https://360tv.ru/rss/
+https://www.mk.ru/rss/index.xml
+https://www.fontanka.ru/fontanka.rss
+https://www.aif.ru/rss/all.php
+https://www.newsru.com/rss/news.xml
+https://ura.news/rss
