@@ -21,6 +21,10 @@ MAX_POSTS_PER_RUN = 15
 DESCRIPTION_MAX_LEN_TEXT = 2500
 DESCRIPTION_MAX_LEN_CAPTION = 1800
 
+DIGEST_MAX_ITEMS_PER_FEED = 2
+DIGEST_MAX_ITEMS_TOTAL = 12
+DIGEST_MESSAGE_LIMIT = 3800
+
 MEDIA_NS = {"media": "http://search.yahoo.com/mrss/"}
 
 
@@ -64,7 +68,6 @@ def find_video_in_html(text):
 
 def extract_media(item_el):
     """Возвращает (media_url, media_type) где media_type = 'photo' или 'video', либо (None, None)."""
-    # enclosure
     enclosure = item_el.find("enclosure")
     if enclosure is not None:
         url = enclosure.get("url")
@@ -75,7 +78,6 @@ def extract_media(item_el):
             if "image" in mime:
                 return url, "photo"
 
-    # media:content / media:thumbnail
     for tag in ("media:content", "media:thumbnail"):
         el = item_el.find(tag, MEDIA_NS)
         if el is not None:
@@ -86,7 +88,6 @@ def extract_media(item_el):
                     return url, "video"
                 return url, "photo"
 
-    # media:group/media:content
     group = item_el.find("media:group", MEDIA_NS)
     if group is not None:
         for el in group.findall("media:content", MEDIA_NS):
@@ -97,7 +98,6 @@ def extract_media(item_el):
                     return url, "video"
                 return url, "photo"
 
-    # искать в теле description/content:encoded
     raw_desc = item_el.findtext("description", "") or ""
     content_encoded_el = item_el.find("{http://purl.org/rss/1.0/modules/content/}encoded")
     raw_content = content_encoded_el.text if content_encoded_el is not None else ""
@@ -157,28 +157,27 @@ def fetch_feed(url):
     return items
 
 
-def paraphrase(title, desc):
-    """Перефразирует заголовок и описание своими словами через Claude. При ошибке возвращает оригинал."""
+def digest_summarize(title, desc):
+    """Короткий пересказ для карточки внутри дайджеста: эмодзи + мини-заголовок + 2-3 предложения."""
+    fallback_title = f"📌 {title}"
+    fallback_text = (desc or "")[:280]
     if not ANTHROPIC_API_KEY or not desc:
-        return title, desc
+        return fallback_title, fallback_text
     try:
         prompt = (
-            "Перефразируй эту новость своими словами для Telegram-канала: "
-            "живо, подробно, без изменения фактов, без своих оценок и мнений. "
-            "Раскрой все детали, контекст, предысторию и подробности, которые есть в исходном тексте — "
-            "не сокращай информацию, а перескажи её максимально полно и понятно, добавляя нужный контекст, "
-            "предысторию события и возможные последствия, если это уместно. "
-            "Объём — 10-15 предложений, если в исходном тексте достаточно материала для этого; "
-            "если материала мало — пиши столько, сколько позволяет исходный текст, но не сокращай искусственно. "
+            "Кратко перескажи эту новость для карточки в дайджесте Telegram-канала. "
+            "Без изменения фактов, без своих оценок. "
+            "Заголовок — с ОДНИМ подходящим по смыслу эмодзи в начале, короткий и ёмкий (до 8 слов). "
+            "Текст — 2-3 предложения, только самая суть, без воды.\n\n"
             "Ответь СТРОГО в формате:\n"
-            "ЗАГОЛОВОК: <новый короткий заголовок>\n"
-            "ТЕКСТ: <10-15 предложений текста>\n\n"
+            "ЗАГОЛОВОК: <эмодзи> <заголовок>\n"
+            "ТЕКСТ: <2-3 предложения>\n\n"
             f"Исходный заголовок: {title}\n"
             f"Исходный текст: {desc}"
         )
         payload = json.dumps({
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1800,
+            "max_tokens": 400,
             "messages": [{"role": "user", "content": prompt}],
         }).encode()
         req = urllib.request.Request(
@@ -195,32 +194,62 @@ def paraphrase(title, desc):
             data = json.loads(resp.read())
         result = data["content"][0]["text"].strip()
 
-        new_title, new_desc = title, desc
+        new_title, new_text = fallback_title, fallback_text
         m_title = re.search(r"ЗАГОЛОВОК:\s*(.+)", result)
         m_text = re.search(r"ТЕКСТ:\s*(.+)", result, re.DOTALL)
         if m_title:
             new_title = m_title.group(1).strip()
         if m_text:
-            new_desc = m_text.group(1).strip()
-        return new_title, new_desc
+            new_text = m_text.group(1).strip()
+        return new_title, new_text
     except Exception as e:
-        print(f"[перефразирование] не удалось, публикую оригинал: {e}")
-        return title, desc
+        print(f"[дайджест] не удалось перефразировать, использую оригинал: {e}")
+        return fallback_title, fallback_text
 
 
-def build_caption(title, desc, source_name):
-    text = f"<b>{html.escape(title)}</b>"
-    if desc:
-        d = desc[:DESCRIPTION_MAX_LEN_CAPTION].rstrip()
-        text += f"\n\n{html.escape(d)}"
-    return text
+def digest_label_from_env():
+    """Заголовок дайджеста: берётся из переменной DIGEST_LABEL (задаётся в workflow по расписанию),
+    либо подбирается по текущему часу UTC для ручного запуска."""
+    env_label = os.environ.get("DIGEST_LABEL", "").strip()
+    if env_label:
+        return env_label
+    hour_utc = time.gmtime().tm_hour
+    if 3 <= hour_utc < 12:
+        return "☀️ Утренний дайджест"
+    elif 12 <= hour_utc < 19:
+        return "🗞 Дневной дайджест"
+    else:
+        return "🌙 Вечерний дайджест"
 
 
-def build_text(title, desc, source_name):
-    text = f"<b>{html.escape(title)}</b>"
-    if desc:
-        d = desc[:DESCRIPTION_MAX_LEN_TEXT].rstrip()
-        text += f"\n\n{html.escape(d)}"
+def build_digest_text(label, entries):
+    date_str = time.strftime("%d.%m.%Y")
+    header = f"<b>{html.escape(label)} — {date_str}</b>\n<i>Главное за это время, коротко:</i>"
+
+    number_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    separator = "▫️▫️▫️▫️▫️"
+
+    def make_blocks(items):
+        blocks = []
+        for idx, (entry_title, entry_text) in enumerate(items):
+            num = number_emoji[idx] if idx < len(number_emoji) else f"{idx + 1}."
+            block = f"{num} <b>{html.escape(entry_title)}</b>"
+            if entry_text:
+                block += f"\n{html.escape(entry_text)}"
+            blocks.append(block)
+        return blocks
+
+    footer = "Если понравился дайджест — оставьте реакцию 🔥, это помогает каналу расти!\n\n#дайджест #новости"
+
+    def assemble(items):
+        blocks = make_blocks(items)
+        body = f"\n\n{separator}\n\n".join(blocks)
+        return header + "\n\n" + body + "\n\n" + separator + "\n\n" + footer
+
+    text = assemble(entries)
+    while len(text) > DIGEST_MESSAGE_LIMIT and entries:
+        entries = entries[:-1]
+        text = assemble(entries)
     return text
 
 
@@ -238,38 +267,26 @@ def tg_api_call(method, params):
     return result
 
 
-def send_to_telegram(item, source_name):
-    title, desc, media_url, media_type = item["title"], item["desc"], item["media_url"], item["media_type"]
+def send_digest(text, label, cover_media_url, cover_media_type):
+    """Отправляет дайджест: если есть обложка — сначала короткое фото/видео-интро,
+    затем сам дайджест отдельным текстовым сообщением."""
+    intro = f"<b>{html.escape(label)}</b>"
 
-    if media_type == "photo" and media_url:
-        caption = build_caption(title, desc, source_name)
+    if cover_media_type == "photo" and cover_media_url:
         tg_api_call("sendPhoto", {
-            "chat_id": CHANNEL_ID,
-            "photo": media_url,
-            "caption": caption,
-            "parse_mode": "HTML",
+            "chat_id": CHANNEL_ID, "photo": cover_media_url,
+            "caption": intro, "parse_mode": "HTML",
         })
-    elif media_type == "video" and media_url:
-        caption = build_caption(title, desc, source_name)
+    elif cover_media_type == "video" and cover_media_url:
         tg_api_call("sendVideo", {
-            "chat_id": CHANNEL_ID,
-            "video": media_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        })
-    else:
-        text = build_text(title, desc, source_name)
-        tg_api_call("sendMessage", {
-            "chat_id": CHANNEL_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
+            "chat_id": CHANNEL_ID, "video": cover_media_url,
+            "caption": intro, "parse_mode": "HTML",
         })
 
-
-def source_name_from_url(url):
-    m = re.search(r"https?://(?:www\.)?([^/]+)", url)
-    return m.group(1) if m else url
+    tg_api_call("sendMessage", {
+        "chat_id": CHANNEL_ID, "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": "true",
+    })
 
 
 def main():
@@ -278,10 +295,14 @@ def main():
 
     posted = load_posted()
     feeds = load_feeds()
-    total_sent = 0
+
+    entries = []
+    entry_ids = []
+    cover_media_url = None
+    cover_media_type = None
 
     for feed_url in feeds:
-        if total_sent >= MAX_POSTS_PER_RUN:
+        if len(entries) >= DIGEST_MAX_ITEMS_TOTAL:
             break
         try:
             items = fetch_feed(feed_url)
@@ -289,24 +310,36 @@ def main():
             print(f"[ошибка] не удалось прочитать {feed_url}: {e}")
             continue
 
-        source_name = source_name_from_url(feed_url)
-        new_items = [it for it in items if it["id"] not in posted][:MAX_ITEMS_PER_FEED]
+        new_items = [it for it in items if it["id"] not in posted][:DIGEST_MAX_ITEMS_PER_FEED]
 
         for item in reversed(new_items):
-            if total_sent >= MAX_POSTS_PER_RUN:
+            if len(entries) >= DIGEST_MAX_ITEMS_TOTAL:
                 break
-            item["title"], item["desc"] = paraphrase(item["title"], item["desc"])
-            try:
-                send_to_telegram(item, source_name)
-                posted.add(item["id"])
-                total_sent += 1
-                print(f"[ок] опубликовано: {item['title'][:60]}")
-                time.sleep(2)
-            except Exception as e:
-                print(f"[ошибка] не удалось опубликовать: {e}")
+            entry_title, entry_text = digest_summarize(item["title"], item["desc"])
+            entries.append((entry_title, entry_text))
+            entry_ids.append(item["id"])
 
-    save_posted(posted)
-    print(f"Готово. Опубликовано новых постов: {total_sent}")
+            if cover_media_url is None and item["media_url"]:
+                cover_media_url = item["media_url"]
+                cover_media_type = item["media_type"]
+
+            print(f"[ок] добавлено в дайджест: {item['title'][:60]}")
+
+    if not entries:
+        print("Готово. Новых новостей для дайджеста не найдено.")
+        return
+
+    label = digest_label_from_env()
+    text = build_digest_text(label, entries)
+
+    try:
+        send_digest(text, label, cover_media_url, cover_media_type)
+        for eid in entry_ids:
+            posted.add(eid)
+        save_posted(posted)
+        print(f"Готово. Дайджест опубликован, новостей в нём: {len(entries)}")
+    except Exception as e:
+        print(f"[ошибка] не удалось опубликовать дайджест: {e}")
 
 
 if __name__ == "__main__":
