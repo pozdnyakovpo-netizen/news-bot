@@ -2,7 +2,7 @@ name: Публикация новостей в Telegram
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "*/40 * * * *"
   workflow_dispatch:
 
 jobs:
