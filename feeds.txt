@@ -15,3 +15,13 @@ https://www.fontanka.ru/fontanka.rss
 https://www.aif.ru/rss/all.php
 https://www.newsru.com/rss/news.xml
 https://ura.news/rss
+https://ria.ru/export/rss2/economy/index.xml
+https://ria.ru/export/rss2/science/index.xml
+https://ria.ru/export/rss2/sport/index.xml
+https://habr.com/ru/rss/all/all/
+https://nplus1.ru/rss
+https://www.cnews.ru/inc/rss/news.xml
+https://3dnews.ru/news/rss/
+https://www.championat.com/rss/news.xml
+https://www.sport-express.ru/services/materials/news/se/
+https://rg.ru/xml/index.xml
