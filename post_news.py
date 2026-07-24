@@ -292,6 +292,45 @@ def fetch_news():
     return new_items
 
 
+# --- AI выбирает самую интересную новость для блока "Главное" ---
+def pick_featured_index(items):
+    if len(items) <= 1:
+        return 0
+    token = get_gigachat_token()
+    if not token:
+        return 0
+    try:
+        listing = "\n".join(f"{i}. {it['text'][:150]}" for i, it in enumerate(items))
+        prompt = (
+            "Ниже список новостей дайджеста, пронумерованных с 0. "
+            "Выбери номер самой интересной и цепляющей новости для широкой аудитории — "
+            "ту, что достойна идти первой как главная. "
+            "Ответь только числом, без пояснений и текста.\n\n" + listing
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 10,
+        }
+        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=15)
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        match = re.search(r"\d+", answer)
+        if match:
+            idx = int(match.group())
+            if 0 <= idx < len(items):
+                return idx
+    except Exception as e:
+        print(f"[WARN] pick_featured_index error: {e}")
+    return 0
+
+
 # --- Отправка в Telegram ---
 def send_to_telegram(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -325,15 +364,19 @@ def format_item(item):
     return body
 
 
-# --- Формирование дайджеста: группировка по категориям, разбивка по лимиту Telegram ---
-def build_digest_messages(items):
+# --- Формирование дайджеста: главная новость + группировка по категориям ---
+def build_digest_messages(items, subscriber_count=None):
     if not items:
         return []
 
-    # группируем, сохраняя порядок первого появления категории
+    featured_idx = pick_featured_index(items)
+    featured = items[featured_idx]
+    rest = [it for i, it in enumerate(items) if i != featured_idx]
+
+    # группируем остальные новости, сохраняя порядок первого появления категории
     groups = {}
     order = []
-    for item in items:
+    for item in rest:
         key = (item["emoji"], item["label"])
         if key not in groups:
             groups[key] = []
@@ -346,11 +389,23 @@ def build_digest_messages(items):
         f"✨ <b>ДАЙДЖЕСТ НОВОСТЕЙ</b> ✨\n"
         f"🗓 {weekday}, {now.strftime('%d.%m.%Y')} · {now.strftime('%H:%M')}\n"
         f"{DIVIDER}\n\n"
+        f"🔥 <b>ГЛАВНОЕ</b>\n\n"
+        f"{format_item(featured)}\n\n"
+        f"{DIVIDER}\n\n"
     )
+
+    growth_line = ""
+    if subscriber_count is not None:
+        upcoming = next((m for m in MILESTONES if m > subscriber_count), None)
+        if upcoming is not None:
+            remaining = upcoming - subscriber_count
+            growth_line = f"🎯 До {upcoming} подписчиков осталось {remaining} — приведи друга!\n"
+
     footer = (
         f"\n{DIVIDER}\n"
         f"👍 Ставьте реакции, если дайджест понравился!\n"
         f"📬 Следующий выпуск уже скоро\n"
+        f"{growth_line}"
         f"{random.choice(CTA_VARIANTS)}"
     )
 
@@ -390,6 +445,25 @@ def get_subscriber_count():
         return None
 
 
+def update_channel_description(count):
+    if count is None or not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    now = datetime.now()
+    description = (
+        f"📰 Новостной дайджест каждые 40 минут\n"
+        f"🔥 {count} подписчиков\n"
+        f"🕒 Обновлено {now.strftime('%d.%m %H:%M')}"
+    )[:255]
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatDescription"
+    try:
+        resp = requests.post(url, json={"chat_id": CHAT_ID, "description": description}, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[WARN] setChatDescription failed: {data}")
+    except Exception as e:
+        print(f"[WARN] setChatDescription error: {e}")
+
+
 def load_last_milestone():
     if os.path.exists(MILESTONES_FILE):
         with open(MILESTONES_FILE, "r") as f:
@@ -402,8 +476,7 @@ def save_last_milestone(value):
         json.dump({"last": value}, f)
 
 
-def maybe_celebrate_milestone():
-    count = get_subscriber_count()
+def maybe_celebrate_milestone(count):
     if count is None:
         return
     last = load_last_milestone()
@@ -426,14 +499,16 @@ def maybe_celebrate_milestone():
 def main():
     print(f"[START] {datetime.now().isoformat()}")
 
-    maybe_celebrate_milestone()  # проверяем веху подписчиков в любом случае
+    count = get_subscriber_count()
+    update_channel_description(count)
+    maybe_celebrate_milestone(count)
 
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
         return
 
-    messages = build_digest_messages(news)
+    messages = build_digest_messages(news, count)
 
     all_ok = True
     for msg in messages:
