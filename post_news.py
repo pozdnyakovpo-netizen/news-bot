@@ -114,6 +114,23 @@ def is_urgent(title, summary=""):
     return any(kw.lower() in t for kw in URGENT_KEYWORDS)
 
 
+# Признаки "не новостного" контента: лайфхаки, списки советов, гороскопы и т.п.
+# Такие статьи иногда попадают в общую RSS-ленту сайта вместе с настоящими новостями.
+NOT_NEWS_PATTERNS = [
+    "лайфхак", "топ-", "5 способов", "10 способов", "7 способов",
+    "5 причин", "10 причин", "5 признаков", "10 признаков",
+    "интересные факты", "полезные советы", "как выбрать", "как избавиться",
+    "чем опасен", "чем опасны", "чем полезен", "чем полезны", "рецепт",
+    "гороскоп", "приметы", "что будет если", "5 фактов", "10 фактов",
+    "простые способы", "правила ухода", "как правильно",
+]
+
+
+def is_not_news(title, summary=""):
+    t = (title + " " + summary).lower()
+    return any(p in t for p in NOT_NEWS_PATTERNS)
+
+
 def pick_category(title, summary=""):
     t = (title + " " + summary).lower()
     for keywords, emoji, label, hashtag in CATEGORY_RULES:
@@ -129,6 +146,46 @@ def source_name(link):
         return domain
     except Exception:
         return ""
+
+
+# --- Извлечение фото/видео из RSS-записи (media RSS, enclosure, <img> в тексте) ---
+def extract_media(entry, raw_summary=""):
+    photo = None
+    video = None
+
+    for m in entry.get("media_content", []) or []:
+        murl = m.get("url")
+        mtype = (m.get("medium") or m.get("type") or "").lower()
+        if not murl:
+            continue
+        if "video" in mtype or murl.lower().endswith((".mp4", ".mov", ".m4v")):
+            video = video or murl
+        elif "image" in mtype or murl.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            photo = photo or murl
+
+    if not photo:
+        thumbs = entry.get("media_thumbnail", []) or []
+        if thumbs and thumbs[0].get("url"):
+            photo = thumbs[0]["url"]
+
+    for enc in entry.get("links", []) or []:
+        if enc.get("rel") != "enclosure":
+            continue
+        eurl = enc.get("href")
+        etype = (enc.get("type") or "").lower()
+        if not eurl:
+            continue
+        if "video" in etype:
+            video = video or eurl
+        elif "image" in etype:
+            photo = photo or eurl
+
+    if not photo and raw_summary:
+        img_match = re.search(r'<img[^>]+src="([^"]+)"', raw_summary)
+        if img_match:
+            photo = img_match.group(1)
+
+    return photo, video
 
 
 # --- Инициализация GigaChat (получение access_token по OAuth) ---
@@ -184,7 +241,7 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f)
 
 
-# --- Перефразирование через GigaChat: жирный заголовок + развёрнутый текст ---
+# --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
 def rewrite_with_ai(title, summary):
     token = get_gigachat_token()
     if not token:
@@ -289,9 +346,12 @@ def fetch_news():
                 continue
 
             title = entry.get("title", "Без заголовка")
-            summary = entry.get("summary", entry.get("description", ""))
-            summary = re.sub(r"<[^>]+>", "", summary)
+            raw_summary = entry.get("summary", entry.get("description", ""))
+            summary = re.sub(r"<[^>]+>", "", raw_summary)
             link = entry.get("link", "")
+
+            if is_not_news(title, summary):
+                continue  # лайфхак/список советов/гороскоп — пропускаем, это не новость
 
             rewritten = rewrite_with_ai(title, summary)
             if rewritten:
@@ -304,6 +364,7 @@ def fetch_news():
             emoji, label, hashtag = pick_category(title, summary)
             src = source_name(link)
             urgent = is_urgent(title, summary)
+            photo, video = extract_media(entry, raw_summary)
 
             new_items.append({
                 "id": entry_id,
@@ -315,13 +376,15 @@ def fetch_news():
                 "headline": headline,
                 "body": body,
                 "link": link,
+                "photo": photo,
+                "video": video,
                 "published": entry.get("published", datetime.now().isoformat())
             })
 
     return new_items
 
 
-# --- AI выбирает самую интересную новость ---
+# --- AI выбирает самую интересную новость для блока "Главное" ---
 def pick_featured_index(items):
     if len(items) <= 1:
         return 0
@@ -384,7 +447,60 @@ def send_to_telegram(text):
         return False
 
 
-# --- Текст одного поста: жирный заголовок + развёрнутый текст, без ссылки на источник ---
+def send_photo_to_telegram(photo_url, caption):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": CHAT_ID,
+        "photo": photo_url,
+        "caption": caption[:1024],  # Telegram: подпись к медиа ограничена 1024 символами
+        "parse_mode": "HTML",
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            return True
+        print(f"[WARN] sendPhoto failed: {resp.text}")
+        return False
+    except Exception as e:
+        print(f"[WARN] sendPhoto error: {e}")
+        return False
+
+
+def send_video_to_telegram(video_url, caption):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
+    payload = {
+        "chat_id": CHAT_ID,
+        "video": video_url,
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return True
+        print(f"[WARN] sendVideo failed: {resp.text}")
+        return False
+    except Exception as e:
+        print(f"[WARN] sendVideo error: {e}")
+        return False
+
+
+def send_post(item, text):
+    """Отправляет пост с видео/фото из источника, если есть, иначе — просто текстом."""
+    if item.get("video"):
+        if send_video_to_telegram(item["video"], text):
+            return True
+    if item.get("photo"):
+        if send_photo_to_telegram(item["photo"], text):
+            return True
+    return send_to_telegram(text)
+
+
+# --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
 def format_post(item, extra=""):
     urgent_tag = "🚨 <b>СРОЧНО</b>\n" if item.get("urgent") else ""
     text = f"{urgent_tag}{item['emoji']} <b>{item['headline']}</b>\n\n{item['body']}"
@@ -504,7 +620,7 @@ def main():
         extra = f"{growth_line}{random.choice(CTA_VARIANTS)}" if is_last else ""
         text = format_post(item, extra=extra)
 
-        ok = send_to_telegram(text)
+        ok = send_post(item, text)
         if ok:
             # помечаем как отправленное СРАЗУ — если следующий пост не уйдёт,
             # уже опубликованные не задвоятся при повторном запуске
