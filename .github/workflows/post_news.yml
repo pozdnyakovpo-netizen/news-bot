@@ -1,49 +1,31 @@
-name: Публикация новостей в Telegram
+name: News Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
-
-concurrency:
-  group: post-news
-  cancel-in-progress: false
+    - cron: "*/2 * * * *"   # проверка каждые 2 минуты (сам бот решает, публиковать или нет)
+  workflow_dispatch:         # позволяет запускать вручную кнопкой в Actions
 
 permissions:
-  contents: write
+  contents: write            # обязательно — без этого бот не сможет сохранить файлы состояния
 
 jobs:
-  post:
+  post-news:
     runs-on: ubuntu-latest
     steps:
-      - name: Скачать код
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Установить Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Установить зависимости
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install feedparser requests urllib3
 
-      - name: Запустить публикацию
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
-        run: python post_news.py
-
-      - name: Сохранить состояние бота
-        run: |
-          git config user.name "news-bot"
-          git config user.email "actions@github.com"
-          git add posted.json milestones.json last_run.json recent_titles.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Update bot state"
-          for i in 1 2 3 4 5; do
-            git pull --rebase origin main && git push && break
-            echo "Push attempt $i failed, retrying..."
-            sleep 3
-          done
+        run: python bot.py
