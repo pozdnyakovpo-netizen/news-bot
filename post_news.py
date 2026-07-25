@@ -519,8 +519,15 @@ def fetch_news():
                 headline = html.escape(rewritten["headline"])
                 body = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
             else:
-                headline = html.escape(truncate_at_word(title, 90))
-                body = html.escape(limit_sentences(summary if summary else title))
+                # Без AI-рерайта берём заголовок из первого ПРЕДЛОЖЕНИЯ, а тело —
+                # из оставшихся: раньше заголовок был просто обрезкой первых 90 символов
+                # текста, а тело — тем же текстом целиком, из-за чего пост дублировал
+                # сам себя (заголовок обрывался "…" и тут же повторялся в теле).
+                source_text = summary if summary else title
+                sentences = [s for s in re.split(r'(?<=[.!?])\s+', source_text.strip()) if s]
+                headline = html.escape(truncate_at_word(sentences[0], 90)) if sentences else html.escape(truncate_at_word(title, 90))
+                rest = " ".join(sentences[1:MAX_SENTENCES + 1])
+                body = html.escape(rest) if rest else ""
 
             src = f"@{entry['source_channel']}" if entry.get("source_channel") else source_name(link)
             urgent = is_urgent(title, summary)
@@ -694,7 +701,9 @@ def format_post(item, extra=""):
     lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
     # Название канала не дублируем текстом внутри поста — Telegram и так
     # показывает его сверху над каждым сообщением.
-    text = f"{lead}<b>{item['headline']}</b>\n\n{item['body']}"
+    text = f"{lead}<b>{item['headline']}</b>"
+    if item.get("body"):
+        text += f"\n\n{item['body']}"
     if random.random() < CHANNEL_SIGNATURE_CHANCE:
         text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
