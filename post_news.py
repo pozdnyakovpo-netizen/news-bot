@@ -27,7 +27,7 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
 POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
 LAST_RUN_FILE = "last_run.json"    # хранит время последней успешной публикации
-MIN_PUBLISH_INTERVAL = 360         # сек, минимальный интервал между публикациями (6 минут)
+MIN_PUBLISH_INTERVAL_RANGE = (300, 420)  # сек, интервал между обычными публикациями (5–7 минут)
 MAX_ITEMS = 15                     # новостей за один запуск — увеличено для высокой частоты публикаций
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
 FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
@@ -375,22 +375,24 @@ def title_dedup_key(title):
 
 
 def can_publish_now():
-    """Не даёт публиковать чаще, чем раз в MIN_PUBLISH_INTERVAL секунд,
+    """Не даёт публиковать обычные новости чаще, чем раз в 5-7 минут
+    (интервал каждый раз выбирается заново, случайно в этом диапазоне),
     независимо от того, как часто на самом деле триггерится workflow."""
     if not os.path.exists(LAST_RUN_FILE):
         return True
     try:
         with open(LAST_RUN_FILE, "r") as f:
             data = json.load(f)
-        last = data.get("last_publish", 0)
-        return (time.time() - last) >= MIN_PUBLISH_INTERVAL
+        next_allowed = data.get("next_allowed", 0)
+        return time.time() >= next_allowed
     except Exception:
         return True
 
 
 def mark_published_now():
+    next_allowed = time.time() + random.randint(*MIN_PUBLISH_INTERVAL_RANGE)
     with open(LAST_RUN_FILE, "w") as f:
-        json.dump({"last_publish": time.time()}, f)
+        json.dump({"last_publish": time.time(), "next_allowed": next_allowed}, f)
 
 
 # --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
@@ -775,10 +777,6 @@ def maybe_celebrate_milestone(count):
 def main():
     print(f"[START] {datetime.now().isoformat()}")
 
-    if not can_publish_now():
-        print(f"[INFO] Skipping run — less than {MIN_PUBLISH_INTERVAL}s since last publish.")
-        return
-
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
@@ -791,6 +789,10 @@ def main():
     # срочные новости — в начало очереди; среди остальных AI выбирает самую интересную
     urgent_items = [it for it in news if it.get("urgent")]
     normal_items = [it for it in news if not it.get("urgent")]
+
+    if not urgent_items and not can_publish_now():
+        print("[INFO] Skipping run — обычные новости ждут своего интервала (5–7 минут), срочных нет.")
+        return
 
     if normal_items:
         featured_idx = pick_featured_index(normal_items)
