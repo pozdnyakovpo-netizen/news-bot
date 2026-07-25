@@ -12,6 +12,7 @@ import hashlib
 import feedparser
 import requests
 import urllib3
+from bs4 import BeautifulSoup
 from urllib.parse import urlparse, quote
 from datetime import datetime
 
@@ -541,6 +542,72 @@ def fetch_feed_with_retry(url):
     return None
 
 
+TELEGRAM_PREVIEW_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+
+def fetch_telegram_channel(username, limit=20):
+    """Читает последние посты публичного Telegram-канала через t.me/s/<username> —
+    это официальная веб-версия предпросмотра канала, доступная без токена бота
+    и без подписки. Возвращает список записей в формате, совместимом с остальным
+    пайплайном (id/title/summary/link/photo/video/published)."""
+    url = f"https://t.me/s/{username}"
+    try:
+        resp = requests.get(url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=FETCH_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[WARN] Telegram fetch failed for @{username}: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    messages = soup.select("div.tgme_widget_message")[-limit:]
+    entries = []
+
+    for msg in messages:
+        post_id = msg.get("data-post")
+        if not post_id:
+            continue
+        link = f"https://t.me/{post_id}"
+
+        text_el = msg.select_one(".tgme_widget_message_text")
+        text = text_el.get_text("\n", strip=True) if text_el else ""
+        if not text:
+            continue  # пост без текста (стикер/чистое медиа) — нечего рерайтить, пропускаем
+
+        first_line = text.split("\n")[0].strip()
+        title = first_line[:200] if first_line else text[:200]
+
+        photo = None
+        photo_el = msg.select_one(".tgme_widget_message_photo_wrap")
+        if photo_el and photo_el.get("style"):
+            m = re.search(r"url\('([^']+)'\)", photo_el["style"])
+            if m:
+                photo = m.group(1)
+
+        video = None
+        video_el = msg.select_one("video.tgme_widget_message_video")
+        if video_el and video_el.get("src"):
+            video = video_el["src"]
+
+        time_el = msg.select_one("time")
+        published = time_el.get("datetime") if time_el and time_el.get("datetime") else datetime.now().isoformat()
+
+        entries.append({
+            "id": link,
+            "title": title,
+            "summary": text,
+            "link": link,
+            "photo": photo,
+            "video": video,
+            "published": published,
+            "source_channel": username,  # флаг: этот пункт пришёл из Telegram, а не из RSS
+        })
+
+    return entries[::-1]  # новые посты в начало списка
+
+
 # --- Основной сбор ---
 def fetch_news():
     posted = load_posted()
@@ -554,19 +621,21 @@ def fetch_news():
         return []
 
     with open(FEEDS_FILE, "r") as f:
-        feed_urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        # feeds.txt теперь содержит юзернеймы Telegram-каналов (без @), по одному на строку —
+        # так бот читает именно те 10 каналов, что были отобраны, а не произвольные RSS-ленты.
+        channels = [line.strip().lstrip("@") for line in f if line.strip() and not line.startswith("#")]
 
-    random.shuffle(feed_urls)  # разный порядок каждый запуск — не даём первым источникам "съедать" весь лимит
+    random.shuffle(channels)  # разный порядок каждый запуск — не даём первым каналам "съедать" весь лимит
 
-    for url in feed_urls:
+    for channel in channels:
         if len(new_items) >= FETCH_POOL_SIZE:
             break
 
-        feed = fetch_feed_with_retry(url)
-        if feed is None:
+        channel_entries = fetch_telegram_channel(channel)
+        if not channel_entries:
             continue
 
-        for entry in feed.entries:
+        for entry in channel_entries:
             if len(new_items) >= FETCH_POOL_SIZE:
                 break
 
@@ -582,7 +651,7 @@ def fetch_news():
             title_words = significant_title_words(title)
             if is_duplicate_by_meaning(title_words, recent_title_words) or \
                any(titles_are_similar(title_words, w) for w in seen_title_words):
-                continue  # та же новость, но другими словами (другое издание) — тоже пропускаем
+                continue  # та же новость, но другими словами (другой канал) — тоже пропускаем
 
             raw_summary = entry.get("summary", entry.get("description", ""))
             # html.unescape убирает &nbsp; и другие HTML-сущности, которые иначе
@@ -593,13 +662,10 @@ def fetch_news():
             if is_not_news(title, summary):
                 continue  # лайфхак/список советов/интервью/колонка — пропускаем, это не новость
 
-            photo, video = extract_media(entry, raw_summary)
-            if not video:
-                # заходим на страницу статьи: ищем настоящее видео (og:video/JSON-LD),
-                # а заодно и обложку, если её тоже не было в RSS — один запрос вместо двух
-                page_photo, page_video = fetch_page_media(link)
-                video = video or page_video
-                photo = photo or page_photo
+            # фото/видео уже извлечены прямо со страницы Telegram-канала (fetch_telegram_channel) —
+            # доп. запрос на страницу источника (fetch_page_media) для таких записей не нужен
+            photo = entry.get("photo")
+            video = entry.get("video")
             if not photo and not video:
                 continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
 
@@ -612,7 +678,7 @@ def fetch_news():
                 body = html.escape(limit_sentences(summary if summary else title))
 
             emoji, label, hashtag = pick_category(title, summary)
-            src = source_name(link)
+            src = f"@{entry['source_channel']}" if entry.get("source_channel") else source_name(link)
             urgent = is_urgent(title, summary)
             print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
 
