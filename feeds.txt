@@ -36,10 +36,8 @@ https://www.banki.ru/xml/news.rss
 https://expert.ru/rss/all/
 
 # Технологии
-https://habr.com/ru/rss/all/all/
 https://www.cnews.ru/inc/rss/news.xml
 https://3dnews.ru/news/rss/
-https://vc.ru/rss/all
 https://hi-tech.mail.ru/rss/all/
 
 # Наука
