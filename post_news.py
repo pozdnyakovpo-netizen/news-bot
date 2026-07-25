@@ -101,12 +101,19 @@ CTA_VARIANTS = [
 MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
 MILESTONES_FILE = "milestones.json"
 
-# Ключевые слова, по которым новость помечается как срочная/важная
+# Редкая подпись канала — добавляется примерно в 1 из 10 постов
+CHANNEL_SIGNATURE_CHANCE = 0.1
+CHANNEL_SIGNATURE = f'📎 <a href="{CHANNEL_LINK}">@{CHANNEL_USERNAME}</a>'
+
+# Ключевые слова, по которым новость помечается как важная — влияет только на эмодзи, без текста
 URGENT_KEYWORDS = [
     "погиб", "убит", "жертв", "экстренн", "чрезвычайн", "эвакуац",
-    "взрыв", "теракт", "катастроф", "срочно", "авари", "пожар",
+    "взрыв", "теракт", "катастроф", "авари", "пожар",
     "обстрел", "атак", "ракет", "ЧП ", "объявлен", "введен режим",
 ]
+
+# Эмодзи-метки для важных новостей — выбирается случайно, без подписи "СРОЧНО"
+URGENT_EMOJIS = ["🔥", "🚨", "❗️", "⚡️"]
 
 
 def is_urgent(title, summary=""):
@@ -148,7 +155,7 @@ def source_name(link):
         return ""
 
 
-# --- Извлечение фото/видео из RSS-записи (media RSS, enclosure, <img> в тексте) ---
+# --- Извлечение фото/видео из RSS-записи (media RSS, enclosure, content, <img> в тексте) ---
 def extract_media(entry, raw_summary=""):
     photo = None
     video = None
@@ -180,10 +187,35 @@ def extract_media(entry, raw_summary=""):
         elif "image" in etype:
             photo = photo or eurl
 
-    if not photo and raw_summary:
-        img_match = re.search(r'<img[^>]+src="([^"]+)"', raw_summary)
-        if img_match:
-            photo = img_match.group(1)
+    # некоторые фиды (WordPress и др.) кладут картинку в отдельное поле image
+    if not photo:
+        img_field = entry.get("image")
+        if isinstance(img_field, dict) and img_field.get("href"):
+            photo = img_field["href"]
+
+    # полный текст статьи (content:encoded) часто содержит <img>, которого нет в summary
+    html_sources = [raw_summary]
+    for c in entry.get("content", []) or []:
+        if c.get("value"):
+            html_sources.append(c["value"])
+
+    if not photo:
+        for html_block in html_sources:
+            if not html_block:
+                continue
+            img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_block)
+            if img_match:
+                photo = img_match.group(1)
+                break
+
+    if not video:
+        for html_block in html_sources:
+            if not html_block:
+                continue
+            vid_match = re.search(r'<source[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']', html_block)
+            if vid_match:
+                video = vid_match.group(1)
+                break
 
     return photo, video
 
@@ -502,9 +534,11 @@ def send_post(item, text):
 
 # --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
 def format_post(item, extra=""):
-    urgent_tag = "🚨 <b>СРОЧНО</b>\n" if item.get("urgent") else ""
-    text = f"{urgent_tag}{item['emoji']} <b>{item['headline']}</b>\n\n{item['body']}"
-    text += f"\n\n{item['hashtag']}"
+    lead_emoji = random.choice(URGENT_EMOJIS) if item.get("urgent") else item["emoji"]
+    text = f"{lead_emoji} <b>{item['headline']}</b>\n\n{item['body']}"
+    text += f"\n\n<tg-spoiler>{item['hashtag']}</tg-spoiler>"
+    if random.random() < CHANNEL_SIGNATURE_CHANCE:
+        text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
         text += f"\n\n{extra}"
     return text
@@ -611,14 +645,10 @@ def main():
 
     news = urgent_items + normal_items
 
-    growth_line = build_growth_line(count)
-
     posted = load_posted()
     sent_count = 0
     for i, item in enumerate(news):
-        is_last = (i == len(news) - 1)
-        extra = f"{growth_line}{random.choice(CTA_VARIANTS)}" if is_last else ""
-        text = format_post(item, extra=extra)
+        text = format_post(item)
 
         ok = send_post(item, text)
         if ok:
