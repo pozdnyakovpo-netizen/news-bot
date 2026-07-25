@@ -144,12 +144,29 @@ NOT_NEWS_PATTERNS = [
     "подкаст", "блог", "мнение:", "спросили у", "разбираем", "объясняем",
     "путеводитель", "подборка", "рейтинг", "рекомендуем", "что посмотреть",
     "что почитать", "что послушать", "тест-драйв", "обзор:",
+    # сводки из нескольких новостей сразу — не годятся под формат "одна новость = один пост":
+    # получаются рваные посты со списком через буллеты вместо связного текста
+    "главные новости дня", "главные новости к этому часу", "итоги дня",
+    "коротко о главном", "новости к этому часу", "главное к этому часу",
 ]
+
+# Символы-маркеры списка, которыми РИА и похожие каналы оформляют сводки
+# из нескольких новостей в одном посте — если таких маркеров 2 и больше,
+# это точно не единичная новость, а дайджест, который не стоит публиковать как есть
+DIGEST_BULLET_CHARS = ["◆", "▪", "‣", "🔹", "🔸"]
+
+
+def is_digest_post(text):
+    return any(text.count(ch) >= 2 for ch in DIGEST_BULLET_CHARS)
 
 
 def is_not_news(title, summary=""):
     t = (title + " " + summary).lower()
-    return any(p in t for p in NOT_NEWS_PATTERNS)
+    if any(p in t for p in NOT_NEWS_PATTERNS):
+        return True
+    if is_digest_post(title + " " + summary):
+        return True
+    return False
 
 
 def pick_category(title, summary=""):
@@ -580,12 +597,17 @@ def fetch_telegram_channel(username, limit=20):
         link = f"https://t.me/{post_id}"
 
         text_el = msg.select_one(".tgme_widget_message_text")
-        text = text_el.get_text("\n", strip=True) if text_el else ""
-        if not text:
+        raw_text = text_el.get_text("\n", strip=True) if text_el else ""
+        if not raw_text:
             continue  # пост без текста (стикер/чистое медиа) — нечего рерайтить, пропускаем
 
-        first_line = text.split("\n")[0].strip()
-        title = first_line[:200] if first_line else text[:200]
+        first_line = raw_text.split("\n")[0].strip()
+        title = first_line[:200] if first_line else raw_text[:200]
+
+        # Для тела убираем ЛЮБЫЕ переносы строк (не только двойные) — иначе из-за
+        # <br> внутри исходного поста текст выходит рваным: обрывки фраз на разных
+        # строках вместо связного абзаца.
+        text = re.sub(r'\s+', ' ', raw_text).strip()
 
         photo = None
         photo_bytes = None
