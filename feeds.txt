@@ -1,6 +1,5 @@
 mash
 bazabazon
-shot_shot
 readovkanews
 ostorozhno_novosti
 rian_ru
