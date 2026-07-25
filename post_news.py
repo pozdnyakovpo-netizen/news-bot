@@ -192,6 +192,18 @@ def strip_source_mentions(text):
     return text
 
 
+def truncate_at_word(text, max_len=90):
+    """Обрезает текст до max_len символов по границе слова (не разрывая слово
+    пополам) и добавляет многоточие, если текст был обрезан."""
+    if not text or len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    last_space = cut.rfind(" ")
+    if last_space > 0:
+        cut = cut[:last_space]
+    return cut.rstrip(" ,.;:—-") + "…"
+
+
 def source_name(link):
     try:
         domain = urlparse(link).netloc
@@ -333,7 +345,7 @@ def get_gigachat_token():
     try:
         # verify=False: GigaChat использует сертификат УЦ Минцифры, которого нет
         # в стандартном наборе доверенных сертификатов на большинстве серверов/раннеров.
-        resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=15)
+        resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=(5, 15))
         resp.raise_for_status()
         payload = resp.json()
         _gigachat_token = payload["access_token"]
@@ -477,7 +489,7 @@ def rewrite_with_ai(title, summary):
             "temperature": 0.7,
             "max_tokens": 800,
         }
-        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
+        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
         if resp.status_code == 401:
             global _gigachat_token
             _gigachat_token = None
@@ -485,7 +497,7 @@ def rewrite_with_ai(title, summary):
             if not token:
                 return None
             headers["Authorization"] = f"Bearer {token}"
-            resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
+            resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
 
         resp.raise_for_status()
         data = resp.json()
@@ -591,7 +603,7 @@ def fetch_news():
                 headline = html.escape(rewritten["headline"])
                 body = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
             else:
-                headline = html.escape(title[:90])
+                headline = html.escape(truncate_at_word(title, 90))
                 body = html.escape(limit_sentences(summary if summary else title))
 
             emoji, label, hashtag = pick_category(title, summary)
@@ -647,7 +659,7 @@ def pick_featured_index(items):
             "temperature": 0.3,
             "max_tokens": 10,
         }
-        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=15)
+        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 15))
         resp.raise_for_status()
         answer = resp.json()["choices"][0]["message"]["content"].strip()
         match = re.search(r"\d+", answer)
@@ -861,6 +873,18 @@ def persist_state_to_git():
             print("[INFO] State files unchanged, nothing to commit.")
             return
         subprocess.run(["git", "commit", "-m", "chore: update bot state [skip ci]"], check=False)
+
+        # Подтягиваем свежие изменения (другие/предыдущие запуски могли успеть
+        # запушить раньше нас) — без этого push будет отклонён как "rejected".
+        pull = subprocess.run(
+            ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+            capture_output=True, text=True
+        )
+        if pull.returncode != 0:
+            print(f"[WARN] git pull --rebase failed, aborting rebase: {pull.stderr}")
+            subprocess.run(["git", "rebase", "--abort"], check=False)
+            return
+
         push = subprocess.run(["git", "push"], capture_output=True, text=True)
         if push.returncode != 0:
             print(f"[WARN] git push failed: {push.stderr}")
