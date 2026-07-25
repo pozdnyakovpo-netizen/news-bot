@@ -9,7 +9,6 @@ import html
 import uuid
 import random
 import hashlib
-import feedparser
 import requests
 import urllib3
 from bs4 import BeautifulSoup
@@ -32,60 +31,9 @@ PUBLISH_INTERVAL = 600             # сек, интервал между ОБЫ�
 URGENT_INTERVAL = 120              # сек, интервал между СРОЧНЫМИ публикациями (2 минуты)
 ITEMS_PER_RUN = 1                  # сколько реально публикуем за один допустимый запуск
 FETCH_POOL_SIZE = 12               # сколько кандидатов собрать перед выбором самой важной новости
-FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
-FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
+FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку страницы канала
 AI_CALL_DELAY = 1.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит — увеличена из-за роста числа источников)
 SEND_DELAY = 1.5                   # сек, пауза между отправками отдельных постов (анти-флуд)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
-}
-
-# Эмодзи и русские названия категорий — определяем по ключевым словам
-# в заголовке + кратком описании новости. Порядок важен: первое совпадение побеждает.
-CATEGORY_RULES = [
-    (["спорт", "футбол", "хоккей", "олимпиад", "чемпионат", "матч", "турнир",
-      "сборная", "тренер", "гол ", "теннис", "баскетбол", "волейбол", "марафон"],
-     "⚽", "Спорт", "#спорт"),
-    (["экономик", "рубл", "доллар", "евро", "нефт", "банк", "рынок", "инфляц",
-      "бюджет", "актив", "приватиз", "компани", "завод", "бизнес", "инвестиц",
-      "налог", "цена", "товар", "экспорт", "импорт", "производств", "бренд",
-      "предприяти", "прибыл", "убыт", "акци", "биржа"],
-     "💰", "Экономика", "#экономика"),
-    (["технолог", "ии ", "искусственн", "робот", "гаджет", "смартфон",
-      "интернет", "приложени", "разработ", "стартап", "программ", "цифров",
-      "нейросет", "чип", "процессор", "софт", "гейминг", "видеоигр"],
-     "💻", "Технологии", "#технологии"),
-    (["наука", "учен", "исследован", "космос", "открыт", "эксперимент",
-      "лаборатор", "генетик", "вселенн", "спутник", "ракет", "археолог"],
-     "🔬", "Наука", "#наука"),
-    (["погод", "климат", "ураган", "снег", "морож", "дожд", "жара",
-      "гроза", "шторм", "потепл", "заморозк"],
-     "🌦", "Погода", "#погода"),
-    (["здоровь", "медицин", "врач", "болезн", "вирус", "больниц", "вакцин",
-      "эпидеми", "пациент", "лечени", "препарат", "клиник"],
-     "🩺", "Здоровье", "#здоровье"),
-    (["политик", "президент", "правительств", "министр", "закон", "госдум",
-      "депутат", "указ", "санкц", "переговор", "парламент", "выбор", "чиновник"],
-     "🏛", "Политика", "#политика"),
-    (["происшеств", "авари", "пожар", "взрыв", "трагед", "погиб", "пострада",
-      "дтп", "эвакуац", "преступлен", "ограничил", "чрезвычайн", "разыскива",
-      "задержан", "суд ", "уголовн"],
-     "🚨", "Происшествия", "#происшествия"),
-    (["культур", "кино", "музык", "театр", "выставк", "концерт", "фестивал",
-      "книга", "актер", "актрис", "режиссер", "премьер"],
-     "🎭", "Культура", "#культура"),
-    (["аэропорт", "рейс", "самолет", "поезд", "автомоб", "дорог", "метро",
-      "трасс", "маршрут", "перевозк", "транспорт", "вокзал"],
-     "🚗", "Транспорт", "#транспорт"),
-]
-DEFAULT_EMOJI = "📰"
-DEFAULT_LABEL = "Разное"
-DEFAULT_HASHTAG = "#новости"
-
-WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-
-DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
 CHANNEL_USERNAME = "deepdailyfact"
 CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
@@ -169,14 +117,6 @@ def is_not_news(title, summary=""):
     return False
 
 
-def pick_category(title, summary=""):
-    t = (title + " " + summary).lower()
-    for keywords, emoji, label, hashtag in CATEGORY_RULES:
-        if any(kw in t for kw in keywords):
-            return emoji, label, hashtag
-    return DEFAULT_EMOJI, DEFAULT_LABEL, DEFAULT_HASHTAG
-
-
 MAX_SENTENCES = 7  # максимум предложений в теле поста — только самое важное, без воды
 
 
@@ -234,116 +174,6 @@ def source_name(link):
         return ""
 
 
-# --- Извлечение фото/видео из RSS-записи (media RSS, enclosure, content, <img> в тексте) ---
-def extract_media(entry, raw_summary=""):
-    photo = None
-    video = None
-
-    for m in entry.get("media_content", []) or []:
-        murl = m.get("url")
-        mtype = (m.get("medium") or m.get("type") or "").lower()
-        if not murl:
-            continue
-        if "video" in mtype or murl.lower().endswith((".mp4", ".mov", ".m4v")):
-            video = video or murl
-        elif "image" in mtype or murl.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-            photo = photo or murl
-
-    if not photo:
-        thumbs = entry.get("media_thumbnail", []) or []
-        if thumbs and thumbs[0].get("url"):
-            photo = thumbs[0]["url"]
-
-    for enc in entry.get("links", []) or []:
-        if enc.get("rel") != "enclosure":
-            continue
-        eurl = enc.get("href")
-        etype = (enc.get("type") or "").lower()
-        if not eurl:
-            continue
-        if "video" in etype:
-            video = video or eurl
-        elif "image" in etype:
-            photo = photo or eurl
-
-    # некоторые фиды (WordPress и др.) кладут картинку в отдельное поле image
-    if not photo:
-        img_field = entry.get("image")
-        if isinstance(img_field, dict) and img_field.get("href"):
-            photo = img_field["href"]
-
-    # полный текст статьи (content:encoded) часто содержит <img>, которого нет в summary
-    html_sources = [raw_summary]
-    for c in entry.get("content", []) or []:
-        if c.get("value"):
-            html_sources.append(c["value"])
-
-    if not photo:
-        for html_block in html_sources:
-            if not html_block:
-                continue
-            img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_block)
-            if img_match:
-                photo = img_match.group(1)
-                break
-
-    if not video:
-        for html_block in html_sources:
-            if not html_block:
-                continue
-            vid_match = re.search(r'<source[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']', html_block)
-            if vid_match:
-                video = vid_match.group(1)
-                break
-
-    return photo, video
-
-
-def fetch_page_media(link, timeout=6):
-    """Резервный способ найти фото и видео: заходим на страницу статьи
-    и ищем стандартную обложку (og:image) и реальное видео —
-    через og:video или через JSON-LD разметку (contentUrl), которую
-    такие сайты, как ТАСС и РИА, используют для SEO у видеоновостей.
-    Один запрос к странице вместо двух отдельных."""
-    photo, video = None, None
-    if not link:
-        return photo, video
-    try:
-        resp = requests.get(link, headers=HEADERS, timeout=timeout, verify=False)
-        if resp.status_code != 200:
-            return photo, video
-        chunk = resp.text[:300000]
-
-        img_match = re.search(
-            r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            chunk, re.IGNORECASE
-        )
-        if not img_match:
-            img_match = re.search(
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']',
-                chunk, re.IGNORECASE
-            )
-        if img_match:
-            photo = img_match.group(1)
-
-        # 1) og:video — прямая ссылка на файл, если сайт её публикует
-        vid_match = re.search(
-            r'<meta[^>]+(?:property|name)=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+\.mp4[^"\']*)["\']',
-            chunk, re.IGNORECASE
-        )
-        # 2) JSON-LD VideoObject: "contentUrl":"....mp4" — частый паттерн у ТАСС/РИА
-        if not vid_match:
-            vid_match = re.search(r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"', chunk, re.IGNORECASE)
-        # 3) прямой <video><source src="....mp4">
-        if not vid_match:
-            vid_match = re.search(r'<source[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']', chunk, re.IGNORECASE)
-        if vid_match:
-            video = vid_match.group(1).replace("\\/", "/")
-    except Exception as e:
-        print(f"[WARN] page media fetch failed for {link}: {e}")
-    return photo, video
-
-
 # --- Инициализация GigaChat (получение access_token по OAuth) ---
 _gigachat_token = None
 _gigachat_token_expires_at = 0  # unix-время истечения токена
@@ -384,17 +214,27 @@ else:
     print("[WARN] GIGACHAT_AUTH_KEY not set, AI rewriting disabled.")
 
 
-# --- Загрузка уже отправленных ID ---
+def _load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
 def load_posted():
-    if os.path.exists(POSTED_FILE):
-        with open(POSTED_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+    return set(_load_json(POSTED_FILE, []))
 
 
 def save_posted(posted_set):
-    with open(POSTED_FILE, "w") as f:
-        json.dump(list(posted_set), f)
+    _save_json(POSTED_FILE, list(posted_set))
 
 
 def title_dedup_key(title):
@@ -440,20 +280,12 @@ RECENT_TITLES_LIMIT = 300  # сколько последних заголовк�
 
 
 def load_recent_title_words():
-    if os.path.exists(RECENT_TITLES_FILE):
-        try:
-            with open(RECENT_TITLES_FILE, "r") as f:
-                data = json.load(f)
-            return [set(words) for words in data]
-        except Exception:
-            return []
-    return []
+    return [set(words) for words in _load_json(RECENT_TITLES_FILE, [])]
 
 
 def save_recent_title_words(list_of_word_sets):
     trimmed = list_of_word_sets[-RECENT_TITLES_LIMIT:]
-    with open(RECENT_TITLES_FILE, "w") as f:
-        json.dump([list(s) for s in trimmed], f)
+    _save_json(RECENT_TITLES_FILE, [list(s) for s in trimmed])
 
 
 def is_duplicate_by_meaning(words, recent_word_sets):
@@ -463,22 +295,12 @@ def is_duplicate_by_meaning(words, recent_word_sets):
 def seconds_since_last_publish():
     """Сколько секунд прошло с последней успешной публикации.
     Возвращает None, если публикаций ещё не было (можно публиковать сразу)."""
-    if not os.path.exists(LAST_RUN_FILE):
-        return None
-    try:
-        with open(LAST_RUN_FILE, "r") as f:
-            data = json.load(f)
-        last_publish = data.get("last_publish")
-        if not last_publish:
-            return None
-        return time.time() - last_publish
-    except Exception:
-        return None
+    last_publish = _load_json(LAST_RUN_FILE, {}).get("last_publish")
+    return (time.time() - last_publish) if last_publish else None
 
 
 def mark_published_now():
-    with open(LAST_RUN_FILE, "w") as f:
-        json.dump({"last_publish": time.time()}, f)
+    _save_json(LAST_RUN_FILE, {"last_publish": time.time()})
 
 
 # --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
@@ -545,26 +367,6 @@ def rewrite_with_ai(title, summary):
     except Exception as e:
         print(f"[ERROR] GigaChat rewrite error: {e}")
         return None
-
-
-# --- Загрузка одного RSS с ретраями ---
-def fetch_feed_with_retry(url):
-    last_error = None
-    for attempt in range(1, FETCH_RETRIES + 1):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT)
-            resp.raise_for_status()
-            feed = feedparser.parse(resp.content)
-            if feed.bozo and not feed.entries:
-                raise ValueError(f"bozo parse error: {feed.bozo_exception}")
-            return feed
-        except Exception as e:
-            last_error = e
-            print(f"[WARN] Attempt {attempt}/{FETCH_RETRIES} failed for {url}: {e}")
-            if attempt < FETCH_RETRIES:
-                time.sleep(2 * attempt)
-    print(f"[ERROR] Failed to parse {url} after {FETCH_RETRIES} attempts: {last_error}")
-    return None
 
 
 TELEGRAM_PREVIEW_HEADERS = {
@@ -705,8 +507,7 @@ def fetch_news():
             if is_not_news(title, summary):
                 continue  # лайфхак/список советов/интервью/колонка — пропускаем, это не новость
 
-            # фото/видео уже извлечены прямо со страницы Telegram-канала (fetch_telegram_channel) —
-            # доп. запрос на страницу источника (fetch_page_media) для таких записей не нужен
+            # фото/видео уже извлечены прямо со страницы Telegram-канала (fetch_telegram_channel)
             photo = entry.get("photo")
             photo_bytes = entry.get("photo_bytes")
             video = entry.get("video")
@@ -721,7 +522,6 @@ def fetch_news():
                 headline = html.escape(truncate_at_word(title, 90))
                 body = html.escape(limit_sentences(summary if summary else title))
 
-            emoji, label, hashtag = pick_category(title, summary)
             src = f"@{entry['source_channel']}" if entry.get("source_channel") else source_name(link)
             urgent = is_urgent(title, summary)
             print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
@@ -730,9 +530,6 @@ def fetch_news():
                 "id": entry_id,
                 "title_key": title_key,
                 "title_words": list(title_words),
-                "emoji": emoji,
-                "label": label,
-                "hashtag": hashtag,
                 "source": src,
                 "urgent": urgent,
                 "headline": headline,
@@ -812,76 +609,55 @@ def send_to_telegram(text):
         return False
 
 
-def send_photo_to_telegram(photo_url, caption=None, photo_bytes=None):
+def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=None):
+    """Общая отправка фото/видео с тремя попытками по убыванию надёжности:
+    1) уже скачанные байты (если есть — самый надёжный путь);
+    2) отправка по ссылке (Telegram сам скачивает);
+    3) скачиваем сами и шлём файлом (на случай, если CDN не даёт скачать без Referer)."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/send{method}"
+    cap = {"caption": caption[:1024], "parse_mode": "HTML"} if caption is not None else {}
+    filename = "photo.jpg" if field == "photo" else "video.mp4"
 
-    # Если байты картинки уже скачаны заранее (в момент чтения канала, пока ссылка
-    # точно рабочая) — шлём их напрямую, это самый надёжный путь.
-    if photo_bytes:
+    if media_bytes:
         try:
-            files = {"photo": ("photo.jpg", photo_bytes)}
-            data = {"chat_id": CHAT_ID}
-            if caption is not None:
-                data["caption"] = caption[:1024]
-                data["parse_mode"] = "HTML"
-            resp = requests.post(url, data=data, files=files, timeout=30)
+            resp = requests.post(url, data={"chat_id": CHAT_ID, **cap},
+                                  files={field: (filename, media_bytes)}, timeout=30)
             if resp.status_code == 200:
                 return True
-            print(f"[WARN] sendPhoto by cached bytes failed: {resp.text}")
+            print(f"[WARN] send{method} by cached bytes failed: {resp.text}")
         except Exception as e:
-            print(f"[WARN] sendPhoto by cached bytes error: {e}")
+            print(f"[WARN] send{method} by cached bytes error: {e}")
 
-    payload = {"chat_id": CHAT_ID, "photo": photo_url}
-    if caption is not None:
-        payload["caption"] = caption[:1024]  # Telegram: подпись к медиа ограничена 1024 символами
-        payload["parse_mode"] = "HTML"
     try:
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = requests.post(url, json={"chat_id": CHAT_ID, field: media_url, **cap}, timeout=15)
         if resp.status_code == 200:
             return True
-        print(f"[WARN] sendPhoto by URL failed: {resp.text}")
+        print(f"[WARN] send{method} by URL failed: {resp.text}")
     except Exception as e:
-        print(f"[WARN] sendPhoto by URL error: {e}")
+        print(f"[WARN] send{method} by URL error: {e}")
 
-    # Последний резерв: скачиваем сами по ссылке (может не сработать, если CDN
-    # уже не отдаёт файл без правильного Referer или ссылка "протухла").
     try:
-        img_resp = requests.get(photo_url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=15)
-        img_resp.raise_for_status()
-        files = {"photo": ("photo.jpg", img_resp.content)}
-        data = {"chat_id": CHAT_ID}
-        if caption is not None:
-            data["caption"] = caption[:1024]
-            data["parse_mode"] = "HTML"
-        resp = requests.post(url, data=data, files=files, timeout=30)
+        dl = requests.get(media_url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=20)
+        dl.raise_for_status()
+        resp = requests.post(url, data={"chat_id": CHAT_ID, **cap},
+                              files={field: (filename, dl.content)}, timeout=30)
         if resp.status_code == 200:
             return True
-        print(f"[WARN] sendPhoto by upload failed: {resp.text}")
+        print(f"[WARN] send{method} by upload failed: {resp.text}")
         return False
     except Exception as e:
-        print(f"[WARN] sendPhoto by upload error: {e}")
+        print(f"[WARN] send{method} by upload error: {e}")
         return False
+
+
+def send_photo_to_telegram(photo_url, caption=None, photo_bytes=None):
+    return _send_media_to_telegram("Photo", "photo", photo_url, caption, photo_bytes)
 
 
 def send_video_to_telegram(video_url, caption=None):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
-    payload = {"chat_id": CHAT_ID, "video": video_url}
-    if caption is not None:
-        payload["caption"] = caption[:1024]
-        payload["parse_mode"] = "HTML"
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-        if resp.status_code == 200:
-            return True
-        print(f"[WARN] sendVideo failed: {resp.text}")
-        return False
-    except Exception as e:
-        print(f"[WARN] sendVideo error: {e}")
-        return False
+    return _send_media_to_telegram("Video", "video", video_url, caption)
 
 
 def send_post(item, text):
@@ -916,24 +692,14 @@ def send_post(item, text):
 # --- Текст одного поста в стиле крупных СМИ-каналов: моноширинное название + жирный заголовок + текст ---
 def format_post(item, extra=""):
     lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
-    # <code> рендерится моноширинным шрифтом — визуально отличается от обычного
-    # жирного текста заголовка/тела поста ниже, это и есть "другой шрифт" в рамках Telegram
-    text = f"<code>ФАКТЫ ДНЯ</code>\n\n{lead}<b>{item['headline']}</b>\n\n{item['body']}"
+    # Название канала не дублируем текстом внутри поста — Telegram и так
+    # показывает его сверху над каждым сообщением.
+    text = f"{lead}<b>{item['headline']}</b>\n\n{item['body']}"
     if random.random() < CHANNEL_SIGNATURE_CHANCE:
         text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
         text += f"\n\n{extra}"
     return text
-
-
-def build_growth_line(subscriber_count):
-    if subscriber_count is None:
-        return ""
-    upcoming = next((m for m in MILESTONES if m > subscriber_count), None)
-    if upcoming is None:
-        return ""
-    remaining = upcoming - subscriber_count
-    return f"🎯 До {upcoming} подписчиков осталось {remaining} — приведи друга!\n"
 
 
 # --- Умное самопродвижение: авто-поздравление с вехами подписчиков ---
@@ -973,15 +739,11 @@ def update_channel_description(count):
 
 
 def load_last_milestone():
-    if os.path.exists(MILESTONES_FILE):
-        with open(MILESTONES_FILE, "r") as f:
-            return json.load(f).get("last", 0)
-    return 0
+    return _load_json(MILESTONES_FILE, {}).get("last", 0)
 
 
 def save_last_milestone(value):
-    with open(MILESTONES_FILE, "w") as f:
-        json.dump({"last": value}, f)
+    _save_json(MILESTONES_FILE, {"last": value})
 
 
 def maybe_celebrate_milestone(count):
