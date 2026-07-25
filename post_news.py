@@ -393,7 +393,9 @@ def fetch_news():
                 body = html.escape(rewritten["body"])
             else:
                 headline = html.escape(title[:90])
-                body = html.escape(summary[:200] + "..." if summary else title)
+                # ВАЖНО: не обрезаем описание — используем его целиком, чтобы
+                # пост не заканчивался многоточием, если GigaChat не переписал новость
+                body = html.escape(summary if summary else title)
 
             emoji, label, hashtag = pick_category(title, summary)
             src = source_name(link)
@@ -523,7 +525,8 @@ def send_video_to_telegram(video_url, caption=None):
 def send_post(item, text):
     """Отправляет медиа из источника (если есть) + полный текст.
     Если текст помещается в подпись (≤1024 симв.) — идёт вместе с медиа одним сообщением.
-    Если текст длиннее — медиа уходит отдельно, следом полным сообщением текст."""
+    Если текст длиннее — медиа уходит отдельно (без подписи), следом полным сообщением текст,
+    чтобы новость никогда не обрывалась."""
     media_url = item.get("video") or item.get("photo")
     is_video = bool(item.get("video"))
 
