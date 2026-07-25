@@ -55,12 +55,6 @@ CTA_VARIANTS = [
 MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
 MILESTONES_FILE = "milestones.json"
 
-# Редкая подпись канала — добавляется примерно в 1 из 25 постов.
-# Крупные новостные каналы (РБК, ТАСС) вообще не рекламируют себя в обычных постах —
-# держим частоту минимальной, чтобы не выглядеть как "продающий" канал.
-CHANNEL_SIGNATURE_CHANCE = 0.04
-CHANNEL_SIGNATURE = f'📎 <a href="{CHANNEL_LINK}">@{CHANNEL_USERNAME}</a>'
-
 # Ключевые слова, по которым новость помечается как важная — влияет только на эмодзи, без текста.
 # Список специально узкий: если помечать срочным каждую новость про "атаку" или "обстрел",
 # метка перестаёт что-либо значить (как у каналов, где "🚨СРОЧНО🚨" стоит через пост).
@@ -699,13 +693,9 @@ def send_post(item, text):
 # --- Текст одного поста в стиле крупных СМИ-каналов: моноширинное название + жирный заголовок + текст ---
 def format_post(item, extra=""):
     lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
-    # Название канала не дублируем текстом внутри поста — Telegram и так
-    # показывает его сверху над каждым сообщением.
     text = f"{lead}<b>{item['headline']}</b>"
     if item.get("body"):
         text += f"\n\n{item['body']}"
-    if random.random() < CHANNEL_SIGNATURE_CHANCE:
-        text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
         text += f"\n\n{extra}"
     return text
@@ -899,14 +889,21 @@ def main():
     urgent_items = [it for it in news if it.get("urgent")]
     normal_items = [it for it in news if not it.get("urgent")]
 
+    def prefer_video(items):
+        """Если среди кандидатов есть новости с видео — выбираем только из них
+        (видео заметнее фото); иначе берём весь список как есть."""
+        with_video = [it for it in items if it.get("video")]
+        return with_video if with_video else items
+
     if urgent_items:
-        chosen = urgent_items[0]
+        chosen = prefer_video(urgent_items)[0]
     else:
         # обычные новости всё равно ждут полный десятиминутный интервал
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
             return
+        normal_items = prefer_video(normal_items)
         featured_idx = pick_featured_index(normal_items)
         chosen = normal_items[featured_idx]
 
