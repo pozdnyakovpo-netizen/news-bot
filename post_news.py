@@ -364,15 +364,66 @@ def save_posted(posted_set):
 
 
 def title_dedup_key(title):
-    """Ключ для отсева новостей-дублей: одна и та же новость часто
-    выходит у нескольких изданий с разными ссылками/ID, но с очень
-    похожим заголовком. Приводим к нижнему регистру, убираем
-    пунктуацию и берём хэш — так разные источники одной новости
-    дают одинаковый ключ."""
+    """Ключ для отсева ТОЧНЫХ дублей (одна и та же RSS-запись): приводим
+    к нижнему регистру, убираем пунктуацию и берём хэш."""
     t = title.lower()
     t = re.sub(r'[^a-zа-яё0-9\s]', '', t, flags=re.IGNORECASE)
     t = re.sub(r'\s+', ' ', t).strip()
     return "title:" + hashlib.md5(t.encode("utf-8")).hexdigest()
+
+
+TITLE_STOPWORDS = {
+    "и", "в", "на", "с", "со", "по", "за", "для", "от", "к", "из", "у", "о", "об",
+    "при", "до", "под", "над", "же", "ли", "бы", "не", "но", "а", "то", "там", "тут",
+    "эта", "этот", "эти", "это", "как", "их", "его", "её", "стал", "стала", "стали",
+    "новый", "новая", "новые", "после", "более", "менее", "который", "которая",
+}
+
+
+def significant_title_words(title):
+    """Ключевые слова заголовка (имена, числа, суть) без предлогов и мусора —
+    для нечёткого сравнения: разные издания формулируют заголовок по-разному,
+    но совпадающие имена/цифры/факты выдают одну и ту же новость."""
+    t = title.lower()
+    t = re.sub(r'[^a-zа-яё0-9\s]', ' ', t, flags=re.IGNORECASE)
+    words = {w for w in t.split() if len(w) > 2 and w not in TITLE_STOPWORDS}
+    return words
+
+
+def titles_are_similar(words_a, words_b, threshold=0.5):
+    """Похожи ли два заголовка по смыслу (пересечение ключевых слов).
+    threshold=0.5 — половина значимых слов должна совпасть."""
+    if not words_a or not words_b:
+        return False
+    union = words_a | words_b
+    if not union:
+        return False
+    return (len(words_a & words_b) / len(union)) >= threshold
+
+
+RECENT_TITLES_FILE = "recent_titles.json"
+RECENT_TITLES_LIMIT = 300  # сколько последних заголовков храним для сравнения
+
+
+def load_recent_title_words():
+    if os.path.exists(RECENT_TITLES_FILE):
+        try:
+            with open(RECENT_TITLES_FILE, "r") as f:
+                data = json.load(f)
+            return [set(words) for words in data]
+        except Exception:
+            return []
+    return []
+
+
+def save_recent_title_words(list_of_word_sets):
+    trimmed = list_of_word_sets[-RECENT_TITLES_LIMIT:]
+    with open(RECENT_TITLES_FILE, "w") as f:
+        json.dump([list(s) for s in trimmed], f)
+
+
+def is_duplicate_by_meaning(words, recent_word_sets):
+    return any(titles_are_similar(words, other) for other in recent_word_sets)
 
 
 def can_publish_now():
@@ -475,8 +526,10 @@ def fetch_feed_with_retry(url):
 # --- Основной сбор ---
 def fetch_news():
     posted = load_posted()
+    recent_title_words = load_recent_title_words()  # заголовки за последние ~300 публикаций — для нечёткого сравнения
     new_items = []
-    seen_title_keys = set()  # заголовки, уже отобранные в ЭТОМ запуске (разные источники одной новости)
+    seen_title_keys = set()   # точные дубли в ЭТОМ запуске
+    seen_title_words = []     # смысловые дубли в ЭТОМ запуске (разные формулировки одной новости)
 
     if not os.path.exists(FEEDS_FILE):
         print("[ERROR] feeds.txt not found!")
@@ -507,6 +560,11 @@ def fetch_news():
             title_key = title_dedup_key(title)
             if title_key in posted or title_key in seen_title_keys:
                 continue  # та же новость уже публиковалась (или уже в очереди) под другим источником/ссылкой
+
+            title_words = significant_title_words(title)
+            if is_duplicate_by_meaning(title_words, recent_title_words) or \
+               any(titles_are_similar(title_words, w) for w in seen_title_words):
+                continue  # та же новость, но другими словами (другое издание) — тоже пропускаем
 
             raw_summary = entry.get("summary", entry.get("description", ""))
             # html.unescape убирает &nbsp; и другие HTML-сущности, которые иначе
@@ -543,6 +601,7 @@ def fetch_news():
             new_items.append({
                 "id": entry_id,
                 "title_key": title_key,
+                "title_words": list(title_words),
                 "emoji": emoji,
                 "label": label,
                 "hashtag": hashtag,
@@ -556,6 +615,7 @@ def fetch_news():
                 "published": entry.get("published", datetime.now().isoformat())
             })
             seen_title_keys.add(title_key)
+            seen_title_words.append(title_words)
 
     return new_items
 
@@ -815,6 +875,10 @@ def main():
             posted.add(item["id"])
             posted.add(item["title_key"])  # чтобы та же новость с другого источника не прошла повторно
             save_posted(posted)
+            if item.get("title_words"):
+                recent_words = load_recent_title_words()
+                recent_words.append(set(item["title_words"]))
+                save_recent_title_words(recent_words)
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
