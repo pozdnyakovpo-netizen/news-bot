@@ -519,21 +519,6 @@ def fetch_news():
             if not photo and not video:
                 continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
 
-            rewritten = rewrite_with_ai(title, summary)
-            if rewritten:
-                headline = html.escape(rewritten["headline"])
-                body = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
-            else:
-                # Без AI-рерайта берём заголовок из первого ПРЕДЛОЖЕНИЯ, а тело —
-                # из оставшихся: раньше заголовок был просто обрезкой первых 90 символов
-                # текста, а тело — тем же текстом целиком, из-за чего пост дублировал
-                # сам себя (заголовок обрывался "…" и тут же повторялся в теле).
-                source_text = summary if summary else title
-                sentences = [s for s in re.split(r'(?<=[.!?])\s+', source_text.strip()) if s]
-                headline = html.escape(truncate_at_word(sentences[0], 90)) if sentences else html.escape(truncate_at_word(title, 90))
-                rest = " ".join(sentences[1:MAX_SENTENCES + 1])
-                body = html.escape(rest) if rest else ""
-
             src = f"@{entry['source_channel']}" if entry.get("source_channel") else source_name(link)
             urgent = is_urgent(title, summary)
             print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
@@ -544,8 +529,8 @@ def fetch_news():
                 "title_words": list(title_words),
                 "source": src,
                 "urgent": urgent,
-                "headline": headline,
-                "body": body,
+                "title": title,
+                "summary": summary,
                 "link": link,
                 "photo": photo,
                 "photo_bytes": photo_bytes,
@@ -558,6 +543,26 @@ def fetch_news():
     return new_items
 
 
+def finalize_item(item):
+    """Готовит заголовок и текст поста ДЛЯ ОДНОЙ, уже финально выбранной новости —
+    AI-рерайт вызывается только здесь, а не для каждого из ~12 кандидатов в fetch_news().
+    Раньше рерайтились все кандидаты, из которых публиковался только один — это
+    впустую тратило лимит запросов GigaChat и вызывало постоянные ошибки 429."""
+    rewritten = rewrite_with_ai(item["title"], item["summary"])
+    if rewritten:
+        item["headline"] = html.escape(rewritten["headline"])
+        item["body"] = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
+    else:
+        # Без AI-рерайта берём заголовок из первого ПРЕДЛОЖЕНИЯ, а тело — из
+        # оставшихся: иначе заголовок дублирует начало тела и обрывается "…".
+        source_text = item["summary"] if item["summary"] else item["title"]
+        sentences = [s for s in re.split(r'(?<=[.!?])\s+', source_text.strip()) if s]
+        item["headline"] = html.escape(truncate_at_word(sentences[0], 90)) if sentences else html.escape(truncate_at_word(item["title"], 90))
+        rest = " ".join(sentences[1:MAX_SENTENCES + 1])
+        item["body"] = html.escape(rest) if rest else ""
+    return item
+
+
 # --- AI выбирает самую интересную новость для блока "Главное" ---
 def pick_featured_index(items):
     if len(items) <= 1:
@@ -566,7 +571,7 @@ def pick_featured_index(items):
     if not token:
         return 0
     try:
-        listing = "\n".join(f"{i}. {it['headline']} — {it['body'][:120]}" for i, it in enumerate(items))
+        listing = "\n".join(f"{i}. {it['title']} — {it['summary'][:120]}" for i, it in enumerate(items))
         prompt = (
             "Ниже список новостей дайджеста, пронумерованных с 0. "
             "Выбери номер самой интересной и цепляющей новости для широкой аудитории — "
@@ -918,6 +923,7 @@ def main():
         featured_idx = pick_featured_index(normal_items)
         chosen = normal_items[featured_idx]
 
+    chosen = finalize_item(chosen)
     news = [chosen][:ITEMS_PER_RUN]  # публикуем только самую важную — 1 новость за запуск
 
     posted = load_posted()
