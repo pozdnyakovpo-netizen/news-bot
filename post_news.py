@@ -984,44 +984,97 @@ def maybe_celebrate_milestone(count):
 STATE_FILES = [POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE]
 
 
-def persist_state_to_git():
+def _git_show_json(ref_path, default):
+    """Читает JSON-файл из указанной git-ссылки (например 'origin/main:posted.json'),
+    не трогая рабочую копию. Возвращает default, если файла там нет или он битый."""
+    import subprocess
+    result = subprocess.run(["git", "show", ref_path], capture_output=True, text=True)
+    if result.returncode != 0:
+        return default
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        return default
+
+
+def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_publish=None):
     """Критично для GitHub Actions: раннер каждый раз стартует с чистого чек-аута
     репозитория, поэтому posted.json / recent_titles.json / last_run.json /
     milestones.json нужно закоммитить обратно — иначе на следующем запуске бот
     забывает всё, что уже публиковал, и начинает дублировать новости.
+
+    Раньше слияние делалось через `git pull --rebase`, но это ТЕКСТОВОЕ слияние —
+    оно регулярно ломалось на JSON-файлах, если два запуска (например, по расписанию
+    каждые 2 минуты) пытались сохранить состояние почти одновременно. При конфликте
+    бот просто не сохранял прогресс — а значит на следующем запуске уже опубликованная
+    новость снова считалась "новой" и могла уйти повторно.
+
+    Теперь вместо текстового merge — программное: перед записью забираем САМУЮ свежую
+    версию файлов прямо с сервера (git fetch + git show) и добавляем к ней новые записи
+    в Python (объединение множеств), а не полагаемся на то, что уже лежит в рабочей копии
+    с начала запуска. Конфликтов при таком подходе быть не может в принципе.
     Работает молча, если запущено не в GitHub Actions (например, локально/на сервере)."""
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
+
+    new_posted_ids = new_posted_ids or []
+    new_title_words = new_title_words or []
+
     try:
-        existing = [f for f in STATE_FILES if os.path.exists(f)]
-        if not existing:
-            return
         subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
         subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
-        subprocess.run(["git", "add", *existing], check=False)
-        diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
-        if diff.returncode == 0:
-            print("[INFO] State files unchanged, nothing to commit.")
-            return
-        subprocess.run(["git", "commit", "-m", "chore: update bot state [skip ci]"], check=False)
 
-        # Подтягиваем свежие изменения (другие/предыдущие запуски могли успеть
-        # запушить раньше нас) — без этого push будет отклонён как "rejected".
-        pull = subprocess.run(
-            ["git", "pull", "--rebase", "--autostash", "origin", "main"],
-            capture_output=True, text=True
-        )
-        if pull.returncode != 0:
-            print(f"[WARN] git pull --rebase failed, aborting rebase: {pull.stderr}")
-            subprocess.run(["git", "rebase", "--abort"], check=False)
-            return
+        for attempt in range(1, 4):
+            fetch = subprocess.run(["git", "fetch", "origin", "main"], capture_output=True, text=True)
+            if fetch.returncode != 0:
+                print(f"[WARN] git fetch failed (attempt {attempt}): {fetch.stderr}")
 
-        push = subprocess.run(["git", "push"], capture_output=True, text=True)
-        if push.returncode != 0:
-            print(f"[WARN] git push failed: {push.stderr}")
-        else:
-            print("[INFO] State files committed and pushed.")
+            remote_posted = _git_show_json(f"origin/main:{POSTED_FILE}", [])
+            remote_recent = _git_show_json(f"origin/main:{RECENT_TITLES_FILE}", [])
+            remote_last_run = _git_show_json(f"origin/main:{LAST_RUN_FILE}", {})
+            remote_milestones = _git_show_json(f"origin/main:{MILESTONES_FILE}", {"last": 0})
+
+            merged_posted = set(remote_posted) | set(new_posted_ids)
+            merged_recent = [set(w) for w in remote_recent]
+            if new_title_words:
+                merged_recent.append(set(new_title_words))
+            merged_recent = merged_recent[-RECENT_TITLES_LIMIT:]
+
+            merged_last_run = remote_last_run
+            if new_last_publish and new_last_publish > remote_last_run.get("last_publish", 0):
+                merged_last_run = {"last_publish": new_last_publish}
+
+            local_milestone = load_last_milestone()
+            merged_milestones = {"last": max(remote_milestones.get("last", 0), local_milestone)}
+
+            # Синхронизируем локальную ветку с самой свежей версией на сервере,
+            # чтобы коммит лёг ровно поверх неё (без расхождений и конфликтов).
+            reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
+            if reset.returncode != 0:
+                print(f"[WARN] git reset failed (attempt {attempt}): {reset.stderr}")
+                continue
+
+            save_posted(merged_posted)
+            save_recent_title_words(merged_recent)
+            with open(LAST_RUN_FILE, "w") as f:
+                json.dump(merged_last_run, f)
+            save_last_milestone(merged_milestones["last"])
+
+            subprocess.run(["git", "add", *STATE_FILES], check=False)
+            diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
+            if diff.returncode == 0:
+                print("[INFO] State files unchanged, nothing to commit.")
+                return
+
+            subprocess.run(["git", "commit", "-m", "chore: update bot state [skip ci]"], check=False)
+            push = subprocess.run(["git", "push"], capture_output=True, text=True)
+            if push.returncode == 0:
+                print("[INFO] State files committed and pushed.")
+                return
+            print(f"[WARN] git push failed (attempt {attempt}/3), retrying with fresh fetch: {push.stderr}")
+
+        print("[WARN] Could not push state after 3 attempts — next run may briefly re-see this item.")
     except Exception as e:
         print(f"[WARN] persist_state_to_git error: {e}")
 
@@ -1067,6 +1120,9 @@ def main():
 
     posted = load_posted()
     sent_count = 0
+    new_posted_ids = []
+    new_title_words = None
+    new_last_publish = None
     for i, item in enumerate(news):
         text = format_post(item)
 
@@ -1077,10 +1133,12 @@ def main():
             posted.add(item["id"])
             posted.add(item["title_key"])  # чтобы та же новость с другого источника не прошла повторно
             save_posted(posted)
+            new_posted_ids.extend([item["id"], item["title_key"]])
             if item.get("title_words"):
                 recent_words = load_recent_title_words()
                 recent_words.append(set(item["title_words"]))
                 save_recent_title_words(recent_words)
+                new_title_words = item["title_words"]
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
@@ -1089,8 +1147,13 @@ def main():
 
     if sent_count > 0:
         mark_published_now()
+        new_last_publish = time.time()
 
-    persist_state_to_git()
+    persist_state_to_git(
+        new_posted_ids=new_posted_ids,
+        new_title_words=new_title_words,
+        new_last_publish=new_last_publish,
+    )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
 
