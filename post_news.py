@@ -749,7 +749,7 @@ def send_post(item, text):
 # --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
 def format_post(item, extra=""):
     lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
-    text = f"{lead}<b>{item['headline']}</b>\n\n{item['body']}"
+    text = f"<b>Факты дня</b>\n\n{lead}<b>{item['headline']}</b>\n\n{item['body']}"
     if random.random() < CHANNEL_SIGNATURE_CHANCE:
         text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
