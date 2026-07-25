@@ -282,7 +282,7 @@ def rewrite_with_ai(title, summary):
         prompt = f"""Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 2 частях.
 
 1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце (5–9 слов)
-2) ТЕКСТ — развёрнутое изложение в 3–5 предложениях, живым языком, без канцелярита. Раскрой суть, контекст и ключевые детали, цифры, кто и что сказал — так, чтобы читатель понял всю картину без перехода по ссылке.
+2) ТЕКСТ — развёрнутое, подробное изложение в 6–9 предложениях, живым языком, без канцелярита. Раскрой суть, контекст, предысторию, ключевые детали, цифры, кто и что сказал, возможные последствия — так, чтобы читатель получил полную картину без перехода по ссылке.
 
 Заголовок исходной новости: {title}
 Краткое содержание: {summary if summary else "нет"}
@@ -300,7 +300,7 @@ def rewrite_with_ai(title, summary):
             "model": "GigaChat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 450,
+            "max_tokens": 800,
         }
         resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=20)
         if resp.status_code == 401:
@@ -479,16 +479,14 @@ def send_to_telegram(text):
         return False
 
 
-def send_photo_to_telegram(photo_url, caption):
+def send_photo_to_telegram(photo_url, caption=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": CHAT_ID,
-        "photo": photo_url,
-        "caption": caption[:1024],  # Telegram: подпись к медиа ограничена 1024 символами
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": CHAT_ID, "photo": photo_url}
+    if caption is not None:
+        payload["caption"] = caption[:1024]  # Telegram: подпись к медиа ограничена 1024 символами
+        payload["parse_mode"] = "HTML"
     try:
         resp = requests.post(url, json=payload, timeout=15)
         if resp.status_code == 200:
@@ -500,16 +498,14 @@ def send_photo_to_telegram(photo_url, caption):
         return False
 
 
-def send_video_to_telegram(video_url, caption):
+def send_video_to_telegram(video_url, caption=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
-    payload = {
-        "chat_id": CHAT_ID,
-        "video": video_url,
-        "caption": caption[:1024],
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": CHAT_ID, "video": video_url}
+    if caption is not None:
+        payload["caption"] = caption[:1024]
+        payload["parse_mode"] = "HTML"
     try:
         resp = requests.post(url, json=payload, timeout=30)
         if resp.status_code == 200:
@@ -522,21 +518,33 @@ def send_video_to_telegram(video_url, caption):
 
 
 def send_post(item, text):
-    """Отправляет пост с видео/фото из источника, если есть, иначе — просто текстом."""
-    if item.get("video"):
-        if send_video_to_telegram(item["video"], text):
-            return True
-    if item.get("photo"):
-        if send_photo_to_telegram(item["photo"], text):
-            return True
+    """Отправляет медиа из источника (если есть) + полный текст.
+    Если текст помещается в подпись (≤1024 симв.) — идёт вместе с медиа одним сообщением.
+    Если текст длиннее — медиа уходит отдельно, следом полным сообщением текст."""
+    media_url = item.get("video") or item.get("photo")
+    is_video = bool(item.get("video"))
+
+    if media_url:
+        if len(text) <= 1024:
+            sender = send_video_to_telegram if is_video else send_photo_to_telegram
+            if sender(media_url, text):
+                return True
+            # медиа с подписью не ушло — пробуем совсем без медиа
+            return send_to_telegram(text)
+        else:
+            sender = send_video_to_telegram if is_video else send_photo_to_telegram
+            media_ok = sender(media_url)  # без подписи
+            if media_ok:
+                time.sleep(0.5)
+            return send_to_telegram(text)
+
     return send_to_telegram(text)
 
 
 # --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
 def format_post(item, extra=""):
-    lead_emoji = random.choice(URGENT_EMOJIS) if item.get("urgent") else item["emoji"]
-    text = f"{lead_emoji} <b>{item['headline']}</b>\n\n{item['body']}"
-    text += f"\n\n<tg-spoiler>{item['hashtag']}</tg-spoiler>"
+    lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
+    text = f"{lead}<b>{item['headline']}</b>\n\n{item['body']}"
     if random.random() < CHANNEL_SIGNATURE_CHANCE:
         text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
