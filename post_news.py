@@ -27,7 +27,8 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
 POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
 LAST_RUN_FILE = "last_run.json"    # хранит время последней успешной публикации
-PUBLISH_INTERVAL = 600             # сек, строго фиксированный интервал между публикациями (10 минут)
+PUBLISH_INTERVAL = 600             # сек, интервал между ОБЫЧНЫМИ публикациями (10 минут)
+URGENT_INTERVAL = 120              # сек, интервал между СРОЧНЫМИ публикациями (2 минуты)
 ITEMS_PER_RUN = 1                  # сколько реально публикуем за один допустимый запуск
 FETCH_POOL_SIZE = 12               # сколько кандидатов собрать перед выбором самой важной новости
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
@@ -426,25 +427,25 @@ def is_duplicate_by_meaning(words, recent_word_sets):
     return any(titles_are_similar(words, other) for other in recent_word_sets)
 
 
-def can_publish_now():
-    """Не даёт публиковать чаще, чем раз в PUBLISH_INTERVAL секунд (строго 10 минут),
-    независимо от того, как часто на самом деле триггерится workflow. Без исключений —
-    в том числе для срочных новостей, чтобы интервал был предсказуемым."""
+def seconds_since_last_publish():
+    """Сколько секунд прошло с последней успешной публикации.
+    Возвращает None, если публикаций ещё не было (можно публиковать сразу)."""
     if not os.path.exists(LAST_RUN_FILE):
-        return True
+        return None
     try:
         with open(LAST_RUN_FILE, "r") as f:
             data = json.load(f)
-        next_allowed = data.get("next_allowed", 0)
-        return time.time() >= next_allowed
+        last_publish = data.get("last_publish")
+        if not last_publish:
+            return None
+        return time.time() - last_publish
     except Exception:
-        return True
+        return None
 
 
 def mark_published_now():
-    next_allowed = time.time() + PUBLISH_INTERVAL
     with open(LAST_RUN_FILE, "w") as f:
-        json.dump({"last_publish": time.time(), "next_allowed": next_allowed}, f)
+        json.dump({"last_publish": time.time()}, f)
 
 
 # --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
@@ -746,10 +747,12 @@ def send_post(item, text):
     return send_to_telegram(text)
 
 
-# --- Текст одного поста в стиле крупных СМИ-каналов: жирный заголовок + текст ---
+# --- Текст одного поста в стиле крупных СМИ-каналов: моноширинное название + жирный заголовок + текст ---
 def format_post(item, extra=""):
     lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
-    text = f"<b>Факты дня</b>\n\n{lead}<b>{item['headline']}</b>\n\n{item['body']}"
+    # <code> рендерится моноширинным шрифтом — визуально отличается от обычного
+    # жирного текста заголовка/тела поста ниже, это и есть "другой шрифт" в рамках Telegram
+    text = f"<code>ФАКТЫ ДНЯ</code>\n\n{lead}<b>{item['headline']}</b>\n\n{item['body']}"
     if random.random() < CHANNEL_SIGNATURE_CHANCE:
         text += f"\n\n{CHANNEL_SIGNATURE}"
     if extra:
@@ -834,12 +837,50 @@ def maybe_celebrate_milestone(count):
         print(f"[INFO] Milestone celebrated: {new_milestone} subscribers.")
 
 
+STATE_FILES = [POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE]
+
+
+def persist_state_to_git():
+    """Критично для GitHub Actions: раннер каждый раз стартует с чистого чек-аута
+    репозитория, поэтому posted.json / recent_titles.json / last_run.json /
+    milestones.json нужно закоммитить обратно — иначе на следующем запуске бот
+    забывает всё, что уже публиковал, и начинает дублировать новости.
+    Работает молча, если запущено не в GitHub Actions (например, локально/на сервере)."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    import subprocess
+    try:
+        existing = [f for f in STATE_FILES if os.path.exists(f)]
+        if not existing:
+            return
+        subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
+        subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
+        subprocess.run(["git", "add", *existing], check=False)
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
+        if diff.returncode == 0:
+            print("[INFO] State files unchanged, nothing to commit.")
+            return
+        subprocess.run(["git", "commit", "-m", "chore: update bot state [skip ci]"], check=False)
+        push = subprocess.run(["git", "push"], capture_output=True, text=True)
+        if push.returncode != 0:
+            print(f"[WARN] git push failed: {push.stderr}")
+        else:
+            print("[INFO] State files committed and pushed.")
+    except Exception as e:
+        print(f"[WARN] persist_state_to_git error: {e}")
+
+
 # --- Главная ---
 def main():
     print(f"[START] {datetime.now().isoformat()}")
 
-    if not can_publish_now():
-        print("[INFO] Skipping run — интервал 10 минут ещё не истёк.")
+    elapsed = seconds_since_last_publish()
+
+    # Даже срочная новость не публикуется чаще, чем раз в URGENT_INTERVAL —
+    # это защита от флуда в Telegram, а не искусственная задержка.
+    if elapsed is not None and elapsed < URGENT_INTERVAL:
+        print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
+              f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
         return
 
     count = get_subscriber_count()
@@ -858,6 +899,11 @@ def main():
     if urgent_items:
         chosen = urgent_items[0]
     else:
+        # обычные новости всё равно ждут полный десятиминутный интервал
+        if elapsed is not None and elapsed < PUBLISH_INTERVAL:
+            print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
+                  f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
+            return
         featured_idx = pick_featured_index(normal_items)
         chosen = normal_items[featured_idx]
 
@@ -887,6 +933,8 @@ def main():
 
     if sent_count > 0:
         mark_published_now()
+
+    persist_state_to_git()
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
 
