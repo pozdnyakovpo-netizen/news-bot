@@ -1,61 +1,20 @@
-# Федеральные новости
-https://tass.ru/rss/v2.xml
+https://www.kp.ru/rss/allsections.xml
 https://ria.ru/export/rss2/archive/index.xml
-https://www.interfax.ru/rss.asp
-https://rssexport.rbc.ru/rbcnews/news/30/full.rss
-https://lenta.ru/rss
-https://iz.ru/xml/rss/all.xml
 https://www.gazeta.ru/export/rss/lenta.xml
-https://www.kommersant.ru/RSS/news.xml
-https://www.vedomosti.ru/rss/news
-https://russian.rt.com/rss
-https://tvzvezda.ru/rss/index.xml
-https://360tv.ru/rss/
-https://www.mk.ru/rss/index.xml
-https://www.fontanka.ru/fontanka.rss
-https://www.aif.ru/rss/all.php
-https://www.newsru.com/rss/news.xml
-https://ura.news/rss
-https://rg.ru/xml/index.xml
-https://www.pravda.ru/export/allnews.xml
-https://www.1tv.ru/rss/news.xml
 https://www.vesti.ru/vesti.rss
 https://life.ru/rss
-https://www.kp.ru/rss/allsections.xml
-https://www.pnp.ru/rss/
-https://m24.ru/rss
-https://5-tv.ru/rss/
-https://smotrim.ru/rss
-https://www.ntv.ru/rss/
-
-# Экономика и бизнес
-https://ria.ru/export/rss2/economy/index.xml
-https://www.forbes.ru/newrss.xml
-https://www.finmarket.ru/rss/
-https://www.banki.ru/xml/news.rss
-https://expert.ru/rss/all/
-
-# Технологии
-https://www.cnews.ru/inc/rss/news.xml
-https://3dnews.ru/news/rss/
-https://hi-tech.mail.ru/rss/all/
-
-# Наука
-https://ria.ru/export/rss2/science/index.xml
-https://nplus1.ru/rss
-https://naked-science.ru/rss
-
-# Спорт
-https://ria.ru/export/rss2/sport/index.xml
-https://www.championat.com/rss/news.xml
-https://www.sport-express.ru/services/materials/news/se/
-https://www.sports.ru/rss/all_news.xml
-https://matchtv.ru/rss/allnews.xml
-https://www.eurosport.ru/rss.xml
-
-# Погода
-https://www.gismeteo.ru/rss/
-
-# Здоровье
-https://doctorpiter.ru/rss/
-https://www.medvestnik.ru/rss
+https://russian.rt.com/rss
+https://iz.ru/xml/rss/all.xml
+https://super.ru/rss
+https://www.mk.ru/rss/index.xml
+https://tass.ru/rss/v2.xml
+https://www.osnmedia.ru/rss
+https://ren.tv/export/rss2/index.xml
+https://lenta.ru/rss
+https://www.vedomosti.ru/rss/news
+https://news.ru/rss
+https://vz.ru/export/rss2/index.xml
+https://www.aif.ru/rss/all.php
+https://regnum.ru/rss/news.rss
+https://rg.ru/xml/index.xml
+https://rssexport.rbc.ru/rbcnews/news/30/full.rss
