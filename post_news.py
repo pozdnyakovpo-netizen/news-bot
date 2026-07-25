@@ -361,6 +361,8 @@ def fetch_news():
     with open(FEEDS_FILE, "r") as f:
         feed_urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
+    random.shuffle(feed_urls)  # разный порядок каждый запуск — не даём первым источникам "съедать" весь лимит
+
     for url in feed_urls:
         if len(new_items) >= MAX_ITEMS:
             break
@@ -397,6 +399,7 @@ def fetch_news():
             src = source_name(link)
             urgent = is_urgent(title, summary)
             photo, video = extract_media(entry, raw_summary)
+            print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
 
             new_items.append({
                 "id": entry_id,
