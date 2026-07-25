@@ -130,6 +130,11 @@ NOT_NEWS_PATTERNS = [
     "чем опасен", "чем опасны", "чем полезен", "чем полезны", "рецепт",
     "гороскоп", "приметы", "что будет если", "5 фактов", "10 фактов",
     "простые способы", "правила ухода", "как правильно",
+    # лайфстайл/развлекательный контент — не новости в строгом смысле
+    "интервью", "колонка", "личный опыт", "рассказала о себе", "рассказал о себе",
+    "подкаст", "блог", "мнение:", "спросили у", "разбираем", "объясняем",
+    "путеводитель", "подборка", "рейтинг", "рекомендуем", "что посмотреть",
+    "что почитать", "что послушать", "тест-драйв", "обзор:",
 ]
 
 
@@ -144,6 +149,19 @@ def pick_category(title, summary=""):
         if any(kw in t for kw in keywords):
             return emoji, label, hashtag
     return DEFAULT_EMOJI, DEFAULT_LABEL, DEFAULT_HASHTAG
+
+
+MAX_SENTENCES = 7  # максимум предложений в теле поста — только самое важное, без воды
+
+
+def limit_sentences(text, max_sentences=MAX_SENTENCES):
+    """Обрезает текст по границе предложения, а не посимвольно —
+    чтобы пост не заканчивался на середине слова/мысли."""
+    if not text:
+        return text
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s for s in sentences if s]
+    return " ".join(sentences[:max_sentences]).strip()
 
 
 def source_name(link):
@@ -282,7 +300,7 @@ def rewrite_with_ai(title, summary):
         prompt = f"""Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 2 частях.
 
 1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце (5–9 слов)
-2) ТЕКСТ — развёрнутое, подробное изложение в 6–9 предложениях, живым языком, без канцелярита. Раскрой суть, контекст, предысторию, ключевые детали, цифры, кто и что сказал, возможные последствия — так, чтобы читатель получил полную картину без перехода по ссылке.
+2) ТЕКСТ — СТРОГО не более 7 предложений, живым языком, без канцелярита. Только самое важное: что произошло, кто участвует, ключевые цифры/факты и главное последствие. Без второстепенных деталей, без предыстории и лишних подробностей — только суть.
 
 Заголовок исходной новости: {title}
 Краткое содержание: {summary if summary else "нет"}
@@ -379,28 +397,31 @@ def fetch_news():
             if not entry_id or entry_id in posted:
                 continue
 
-            title = entry.get("title", "Без заголовка")
+            title = html.unescape(entry.get("title", "Без заголовка"))
             raw_summary = entry.get("summary", entry.get("description", ""))
-            summary = re.sub(r"<[^>]+>", "", raw_summary)
+            # html.unescape убирает &nbsp; и другие HTML-сущности, которые иначе
+            # попадали в пост как есть буквами (видно было на скриншоте канала)
+            summary = html.unescape(re.sub(r"<[^>]+>", "", raw_summary))
             link = entry.get("link", "")
 
             if is_not_news(title, summary):
-                continue  # лайфхак/список советов/гороскоп — пропускаем, это не новость
+                continue  # лайфхак/список советов/интервью/колонка — пропускаем, это не новость
+
+            photo, video = extract_media(entry, raw_summary)
+            if not photo and not video:
+                continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
 
             rewritten = rewrite_with_ai(title, summary)
             if rewritten:
                 headline = html.escape(rewritten["headline"])
-                body = html.escape(rewritten["body"])
+                body = html.escape(limit_sentences(rewritten["body"]))
             else:
                 headline = html.escape(title[:90])
-                # ВАЖНО: не обрезаем описание — используем его целиком, чтобы
-                # пост не заканчивался многоточием, если GigaChat не переписал новость
-                body = html.escape(summary if summary else title)
+                body = html.escape(limit_sentences(summary if summary else title))
 
             emoji, label, hashtag = pick_category(title, summary)
             src = source_name(link)
             urgent = is_urgent(title, summary)
-            photo, video = extract_media(entry, raw_summary)
             print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
 
             new_items.append({
