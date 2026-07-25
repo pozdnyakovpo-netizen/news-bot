@@ -8,6 +8,7 @@ import time
 import html
 import uuid
 import random
+import hashlib
 import feedparser
 import requests
 import urllib3
@@ -25,7 +26,9 @@ GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
 POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
-MAX_ITEMS = 10                     # новостей за один запуск — увеличено для высокой частоты публикаций
+LAST_RUN_FILE = "last_run.json"    # хранит время последней успешной публикации
+MIN_PUBLISH_INTERVAL = 180         # сек, минимальный интервал между публикациями (3 минуты)
+MAX_ITEMS = 15                     # новостей за один запуск — увеличено для высокой частоты публикаций
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
 FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
 AI_CALL_DELAY = 0.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит)
@@ -164,6 +167,29 @@ def limit_sentences(text, max_sentences=MAX_SENTENCES):
     return " ".join(sentences[:max_sentences]).strip()
 
 
+SOURCE_MENTION_PATTERNS = [
+    r'https?://\S+',                                   # голые ссылки
+    r'\bwww\.\S+',                                      # ссылки без схемы
+    r'читать\s+(далее|полностью|на сайте)[^.!?]*[.!?]?',
+    r'источник\s*:\s*\S+',
+    r'подробнее\s+(на|в|у)\s+\S+',
+    r'фото\s*:\s*\S+',
+    r'видео\s*:\s*\S+',
+]
+
+
+def strip_source_mentions(text):
+    """Убирает из текста ссылки и явные упоминания источника
+    ('читать далее на...', 'источник: ...' и т.п.), чтобы в посте
+    не оставалось следов, откуда взята новость."""
+    if not text:
+        return text
+    for pattern in SOURCE_MENTION_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
+
 def source_name(link):
     try:
         domain = urlparse(link).netloc
@@ -238,6 +264,32 @@ def extract_media(entry, raw_summary=""):
     return photo, video
 
 
+def fetch_og_image(link, timeout=6):
+    """Резервный способ найти картинку: заходим на страницу статьи
+    и берём стандартную обложку (og:image), если в RSS фото не было."""
+    if not link:
+        return None
+    try:
+        resp = requests.get(link, headers=HEADERS, timeout=timeout, verify=False)
+        if resp.status_code != 200:
+            return None
+        chunk = resp.text[:200000]  # og:image почти всегда в <head>, дальше не ищем
+        match = re.search(
+            r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            chunk, re.IGNORECASE
+        )
+        if not match:
+            match = re.search(
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']',
+                chunk, re.IGNORECASE
+            )
+        if match:
+            return match.group(1)
+    except Exception as e:
+        print(f"[WARN] og:image fetch failed for {link}: {e}")
+    return None
+
+
 # --- Инициализация GigaChat (получение access_token по OAuth) ---
 _gigachat_token = None
 _gigachat_token_expires_at = 0  # unix-время истечения токена
@@ -289,6 +341,37 @@ def load_posted():
 def save_posted(posted_set):
     with open(POSTED_FILE, "w") as f:
         json.dump(list(posted_set), f)
+
+
+def title_dedup_key(title):
+    """Ключ для отсева новостей-дублей: одна и та же новость часто
+    выходит у нескольких изданий с разными ссылками/ID, но с очень
+    похожим заголовком. Приводим к нижнему регистру, убираем
+    пунктуацию и берём хэш — так разные источники одной новости
+    дают одинаковый ключ."""
+    t = title.lower()
+    t = re.sub(r'[^a-zа-яё0-9\s]', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return "title:" + hashlib.md5(t.encode("utf-8")).hexdigest()
+
+
+def can_publish_now():
+    """Не даёт публиковать чаще, чем раз в MIN_PUBLISH_INTERVAL секунд,
+    независимо от того, как часто на самом деле триггерится workflow."""
+    if not os.path.exists(LAST_RUN_FILE):
+        return True
+    try:
+        with open(LAST_RUN_FILE, "r") as f:
+            data = json.load(f)
+        last = data.get("last_publish", 0)
+        return (time.time() - last) >= MIN_PUBLISH_INTERVAL
+    except Exception:
+        return True
+
+
+def mark_published_now():
+    with open(LAST_RUN_FILE, "w") as f:
+        json.dump({"last_publish": time.time()}, f)
 
 
 # --- Перефразирование через GigaChat: жирный заголовок + текст, как у крупных СМИ-каналов ---
@@ -371,6 +454,7 @@ def fetch_feed_with_retry(url):
 def fetch_news():
     posted = load_posted()
     new_items = []
+    seen_title_keys = set()  # заголовки, уже отобранные в ЭТОМ запуске (разные источники одной новости)
 
     if not os.path.exists(FEEDS_FILE):
         print("[ERROR] feeds.txt not found!")
@@ -398,10 +482,14 @@ def fetch_news():
                 continue
 
             title = html.unescape(entry.get("title", "Без заголовка"))
+            title_key = title_dedup_key(title)
+            if title_key in posted or title_key in seen_title_keys:
+                continue  # та же новость уже публиковалась (или уже в очереди) под другим источником/ссылкой
+
             raw_summary = entry.get("summary", entry.get("description", ""))
             # html.unescape убирает &nbsp; и другие HTML-сущности, которые иначе
             # попадали в пост как есть буквами (видно было на скриншоте канала)
-            summary = html.unescape(re.sub(r"<[^>]+>", "", raw_summary))
+            summary = strip_source_mentions(html.unescape(re.sub(r"<[^>]+>", "", raw_summary)))
             link = entry.get("link", "")
 
             if is_not_news(title, summary):
@@ -409,12 +497,14 @@ def fetch_news():
 
             photo, video = extract_media(entry, raw_summary)
             if not photo and not video:
+                photo = fetch_og_image(link)  # резервный поиск обложки на странице статьи
+            if not photo and not video:
                 continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
 
             rewritten = rewrite_with_ai(title, summary)
             if rewritten:
                 headline = html.escape(rewritten["headline"])
-                body = html.escape(limit_sentences(rewritten["body"]))
+                body = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
             else:
                 headline = html.escape(title[:90])
                 body = html.escape(limit_sentences(summary if summary else title))
@@ -426,6 +516,7 @@ def fetch_news():
 
             new_items.append({
                 "id": entry_id,
+                "title_key": title_key,
                 "emoji": emoji,
                 "label": label,
                 "hashtag": hashtag,
@@ -438,6 +529,7 @@ def fetch_news():
                 "video": video,
                 "published": entry.get("published", datetime.now().isoformat())
             })
+            seen_title_keys.add(title_key)
 
     return new_items
 
@@ -660,6 +752,10 @@ def maybe_celebrate_milestone(count):
 def main():
     print(f"[START] {datetime.now().isoformat()}")
 
+    if not can_publish_now():
+        print(f"[INFO] Skipping run — less than {MIN_PUBLISH_INTERVAL}s since last publish.")
+        return
+
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
@@ -690,12 +786,16 @@ def main():
             # помечаем как отправленное СРАЗУ — если следующий пост не уйдёт,
             # уже опубликованные не задвоятся при повторном запуске
             posted.add(item["id"])
+            posted.add(item["title_key"])  # чтобы та же новость с другого источника не прошла повторно
             save_posted(posted)
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
             print(f"[WARN] Failed to send item {item['id']} — will retry next run.")
             break
+
+    if sent_count > 0:
+        mark_published_now()
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
 
