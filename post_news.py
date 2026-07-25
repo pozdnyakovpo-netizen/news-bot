@@ -34,7 +34,7 @@ ITEMS_PER_RUN = 1                  # сколько реально публик�
 FETCH_POOL_SIZE = 12               # сколько кандидатов собрать перед выбором самой важной новости
 FETCH_RETRIES = 3                  # попыток скачать RSS при сбое
 FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку одного фида
-AI_CALL_DELAY = 0.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит)
+AI_CALL_DELAY = 1.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит — увеличена из-за роста числа источников)
 SEND_DELAY = 1.5                   # сек, пауза между отправками отдельных постов (анти-флуд)
 
 HEADERS = {
@@ -505,6 +505,14 @@ def rewrite_with_ai(title, summary):
             headers["Authorization"] = f"Bearer {token}"
             resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
 
+        if resp.status_code == 429:
+            # Лимит запросов в секунду — источников теперь больше (10 Telegram-каналов),
+            # поэтому кандидатов на рерайт стало больше. Пауза подольше и явный лог,
+            # чтобы не заливать логи повторяющейся ошибкой без объяснения.
+            print("[WARN] GigaChat rate limit (429) — backing off.")
+            time.sleep(3)
+            return None
+
         resp.raise_for_status()
         data = resp.json()
         answer = data["choices"][0]["message"]["content"].strip()
@@ -580,11 +588,23 @@ def fetch_telegram_channel(username, limit=20):
         title = first_line[:200] if first_line else text[:200]
 
         photo = None
+        photo_bytes = None
         photo_el = msg.select_one(".tgme_widget_message_photo_wrap")
         if photo_el and photo_el.get("style"):
             m = re.search(r"url\('([^']+)'\)", photo_el["style"])
             if m:
                 photo = m.group(1)
+                # CDN Telegram часто блокирует скачивание без Referer, указывающего
+                # на страницу канала — берём сразу здесь, пока ссылка точно рабочая,
+                # чтобы не пытаться скачать её повторно позже (может уже не открыться).
+                try:
+                    img_headers = dict(TELEGRAM_PREVIEW_HEADERS)
+                    img_headers["Referer"] = url
+                    img_resp = requests.get(photo, headers=img_headers, timeout=10)
+                    if img_resp.status_code == 200 and img_resp.content:
+                        photo_bytes = img_resp.content
+                except Exception as e:
+                    print(f"[WARN] photo download failed for {post_id}: {e}")
 
         video = None
         video_el = msg.select_one("video.tgme_widget_message_video")
@@ -600,6 +620,7 @@ def fetch_telegram_channel(username, limit=20):
             "summary": text,
             "link": link,
             "photo": photo,
+            "photo_bytes": photo_bytes,
             "video": video,
             "published": published,
             "source_channel": username,  # флаг: этот пункт пришёл из Telegram, а не из RSS
@@ -665,6 +686,7 @@ def fetch_news():
             # фото/видео уже извлечены прямо со страницы Telegram-канала (fetch_telegram_channel) —
             # доп. запрос на страницу источника (fetch_page_media) для таких записей не нужен
             photo = entry.get("photo")
+            photo_bytes = entry.get("photo_bytes")
             video = entry.get("video")
             if not photo and not video:
                 continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
@@ -695,6 +717,7 @@ def fetch_news():
                 "body": body,
                 "link": link,
                 "photo": photo,
+                "photo_bytes": photo_bytes,
                 "video": video,
                 "published": entry.get("published", datetime.now().isoformat())
             })
@@ -767,10 +790,27 @@ def send_to_telegram(text):
         return False
 
 
-def send_photo_to_telegram(photo_url, caption=None):
+def send_photo_to_telegram(photo_url, caption=None, photo_bytes=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+
+    # Если байты картинки уже скачаны заранее (в момент чтения канала, пока ссылка
+    # точно рабочая) — шлём их напрямую, это самый надёжный путь.
+    if photo_bytes:
+        try:
+            files = {"photo": ("photo.jpg", photo_bytes)}
+            data = {"chat_id": CHAT_ID}
+            if caption is not None:
+                data["caption"] = caption[:1024]
+                data["parse_mode"] = "HTML"
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            if resp.status_code == 200:
+                return True
+            print(f"[WARN] sendPhoto by cached bytes failed: {resp.text}")
+        except Exception as e:
+            print(f"[WARN] sendPhoto by cached bytes error: {e}")
+
     payload = {"chat_id": CHAT_ID, "photo": photo_url}
     if caption is not None:
         payload["caption"] = caption[:1024]  # Telegram: подпись к медиа ограничена 1024 символами
@@ -779,10 +819,27 @@ def send_photo_to_telegram(photo_url, caption=None):
         resp = requests.post(url, json=payload, timeout=15)
         if resp.status_code == 200:
             return True
-        print(f"[WARN] sendPhoto failed: {resp.text}")
+        print(f"[WARN] sendPhoto by URL failed: {resp.text}")
+    except Exception as e:
+        print(f"[WARN] sendPhoto by URL error: {e}")
+
+    # Последний резерв: скачиваем сами по ссылке (может не сработать, если CDN
+    # уже не отдаёт файл без правильного Referer или ссылка "протухла").
+    try:
+        img_resp = requests.get(photo_url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=15)
+        img_resp.raise_for_status()
+        files = {"photo": ("photo.jpg", img_resp.content)}
+        data = {"chat_id": CHAT_ID}
+        if caption is not None:
+            data["caption"] = caption[:1024]
+            data["parse_mode"] = "HTML"
+        resp = requests.post(url, data=data, files=files, timeout=30)
+        if resp.status_code == 200:
+            return True
+        print(f"[WARN] sendPhoto by upload failed: {resp.text}")
         return False
     except Exception as e:
-        print(f"[WARN] sendPhoto error: {e}")
+        print(f"[WARN] sendPhoto by upload error: {e}")
         return False
 
 
@@ -812,16 +869,20 @@ def send_post(item, text):
     чтобы новость никогда не обрывалась."""
     media_url = item.get("video") or item.get("photo")
     is_video = bool(item.get("video"))
+    photo_bytes = item.get("photo_bytes") if not is_video else None
+
+    def sender(url_, caption_=None):
+        if is_video:
+            return send_video_to_telegram(url_, caption_)
+        return send_photo_to_telegram(url_, caption_, photo_bytes=photo_bytes)
 
     if media_url:
         if len(text) <= 1024:
-            sender = send_video_to_telegram if is_video else send_photo_to_telegram
             if sender(media_url, text):
                 return True
             # медиа с подписью не ушло — пробуем совсем без медиа
             return send_to_telegram(text)
         else:
-            sender = send_video_to_telegram if is_video else send_photo_to_telegram
             media_ok = sender(media_url)  # без подписи
             if media_ok:
                 time.sleep(0.5)
