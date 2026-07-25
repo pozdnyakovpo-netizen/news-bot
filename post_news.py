@@ -264,30 +264,49 @@ def extract_media(entry, raw_summary=""):
     return photo, video
 
 
-def fetch_og_image(link, timeout=6):
-    """Резервный способ найти картинку: заходим на страницу статьи
-    и берём стандартную обложку (og:image), если в RSS фото не было."""
+def fetch_page_media(link, timeout=6):
+    """Резервный способ найти фото и видео: заходим на страницу статьи
+    и ищем стандартную обложку (og:image) и реальное видео —
+    через og:video или через JSON-LD разметку (contentUrl), которую
+    такие сайты, как ТАСС и РИА, используют для SEO у видеоновостей.
+    Один запрос к странице вместо двух отдельных."""
+    photo, video = None, None
     if not link:
-        return None
+        return photo, video
     try:
         resp = requests.get(link, headers=HEADERS, timeout=timeout, verify=False)
         if resp.status_code != 200:
-            return None
-        chunk = resp.text[:200000]  # og:image почти всегда в <head>, дальше не ищем
-        match = re.search(
+            return photo, video
+        chunk = resp.text[:300000]
+
+        img_match = re.search(
             r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             chunk, re.IGNORECASE
         )
-        if not match:
-            match = re.search(
+        if not img_match:
+            img_match = re.search(
                 r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']',
                 chunk, re.IGNORECASE
             )
-        if match:
-            return match.group(1)
+        if img_match:
+            photo = img_match.group(1)
+
+        # 1) og:video — прямая ссылка на файл, если сайт её публикует
+        vid_match = re.search(
+            r'<meta[^>]+(?:property|name)=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+\.mp4[^"\']*)["\']',
+            chunk, re.IGNORECASE
+        )
+        # 2) JSON-LD VideoObject: "contentUrl":"....mp4" — частый паттерн у ТАСС/РИА
+        if not vid_match:
+            vid_match = re.search(r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"', chunk, re.IGNORECASE)
+        # 3) прямой <video><source src="....mp4">
+        if not vid_match:
+            vid_match = re.search(r'<source[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']', chunk, re.IGNORECASE)
+        if vid_match:
+            video = vid_match.group(1).replace("\\/", "/")
     except Exception as e:
-        print(f"[WARN] og:image fetch failed for {link}: {e}")
-    return None
+        print(f"[WARN] page media fetch failed for {link}: {e}")
+    return photo, video
 
 
 # --- Инициализация GigaChat (получение access_token по OAuth) ---
@@ -496,8 +515,12 @@ def fetch_news():
                 continue  # лайфхак/список советов/интервью/колонка — пропускаем, это не новость
 
             photo, video = extract_media(entry, raw_summary)
-            if not photo and not video:
-                photo = fetch_og_image(link)  # резервный поиск обложки на странице статьи
+            if not video:
+                # заходим на страницу статьи: ищем настоящее видео (og:video/JSON-LD),
+                # а заодно и обложку, если её тоже не было в RSS — один запрос вместо двух
+                page_photo, page_video = fetch_page_media(link)
+                video = video or page_video
+                photo = photo or page_photo
             if not photo and not video:
                 continue  # без фото и видео не публикуем — оставляем только визуально насыщенные посты
 
