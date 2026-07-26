@@ -1426,15 +1426,81 @@ def check_silence_alert(elapsed):
     return None
 
 
+# --- Пункт 6: "скорость как метрика доверия" ---
+# Время между появлением новости у источника (Telegram-канала) и
+# публикацией у нас. Не выводится в сами посты (это было бы навязчиво),
+# а копится в отдельном файле и попадает в status.json — как внутренняя
+# аналитика, которую можно использовать хоть в закреплённом сообщении,
+# хоть просто чтобы знать, насколько оперативно работает бот.
+SPEED_STATS_FILE = "speed_stats.json"
+SPEED_STATS_LIMIT = 200
+
+
+def load_speed_stats():
+    return _load_json(SPEED_STATS_FILE, [])
+
+
+def save_speed_stats(samples):
+    _save_json(SPEED_STATS_FILE, samples[-SPEED_STATS_LIMIT:])
+
+
+def parse_source_published(published_str):
+    if not published_str:
+        return None
+    try:
+        # Формат из Telegram (<time datetime="...">) — ISO 8601, иногда с
+        # суффиксом 'Z' вместо явного смещения таймзоны.
+        s = published_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def compute_publish_latency_seconds(source_published_str, publish_time=None):
+    src_ts = parse_source_published(source_published_str)
+    if src_ts is None:
+        return None
+    publish_time = publish_time if publish_time is not None else time.time()
+    latency = publish_time - src_ts
+    # Отбрасываем заведомо некорректные значения: отрицательные (разъехались
+    # часовые пояса при парсинге) или больше суток (источник явно не "живой",
+    # смысла считать это скоростью публикации нет).
+    if latency < 0 or latency > 24 * 3600:
+        return None
+    return latency
+
+
+def speed_stats_summary(samples):
+    latencies = [s.get("latency_seconds") for s in samples if isinstance(s.get("latency_seconds"), (int, float))]
+    if not latencies:
+        return {"count": 0, "avg_minutes": None, "median_minutes": None}
+    latencies_sorted = sorted(latencies)
+    avg = sum(latencies) / len(latencies)
+    mid = len(latencies_sorted) // 2
+    if len(latencies_sorted) % 2:
+        median = latencies_sorted[mid]
+    else:
+        median = (latencies_sorted[mid - 1] + latencies_sorted[mid]) / 2
+    return {
+        "count": len(latencies),
+        "avg_minutes": round(avg / 60, 1),
+        "median_minutes": round(median / 60, 1),
+    }
+
+
 def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
     # Признак 4: снимок состояния для внешнего мониторинга (например,
     # UptimeRobot может проверять поле "healthy" в сыром файле status.json).
+    speed = speed_stats_summary(load_speed_stats())
     return {
         "last_check": datetime.utcnow().isoformat(),
         "seconds_since_last_publish": last_publish_elapsed,
         "healthy": last_publish_elapsed is None or last_publish_elapsed < SILENCE_ALERT_HOURS * 3600,
         "sent_count_last_run": sent_count,
         "note": note,
+        "avg_publish_latency_minutes": speed["avg_minutes"],
+        "median_publish_latency_minutes": speed["median_minutes"],
+        "speed_samples_count": speed["count"],
     }
 
 
@@ -1611,6 +1677,7 @@ STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
+    SPEED_STATS_FILE,
 ]
 
 
@@ -1667,6 +1734,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
+            remote_speed_stats = _git_show_json(f"origin/main:{SPEED_STATS_FILE}", [])
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -1707,6 +1775,13 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 merged_recent_posts.append(post)
             merged_recent_posts = merged_recent_posts[-RECENT_POSTS_LIMIT:]
 
+            # speed_stats.json — та же логика: локальный файл уже дописан
+            # до reset --hard, просто конкатенируем с origin/main и
+            # обрезаем до лимита. Мягкая аналитика, не критичная для
+            # дедупа — точный дедуп записей здесь не нужен.
+            local_speed_stats = load_speed_stats()
+            merged_speed_stats = (list(remote_speed_stats) + local_speed_stats)[-SPEED_STATS_LIMIT:]
+
             merged_digest = new_digest_state if new_digest_state is not None else remote_digest
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
             merged_weekly_recap = new_weekly_recap_state if new_weekly_recap_state is not None else remote_weekly_recap
@@ -1735,6 +1810,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
             _save_json(RECENT_POSTS_FILE, merged_recent_posts)
+            _save_json(SPEED_STATS_FILE, merged_speed_stats)
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -2016,6 +2092,9 @@ def main():
                 "ts": time.time(),
                 "message_id": ok if isinstance(ok, int) else None,
             }])
+            latency = compute_publish_latency_seconds(item.get("published"))
+            if latency is not None:
+                save_speed_stats(load_speed_stats() + [{"latency_seconds": latency, "ts": time.time()}])
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
