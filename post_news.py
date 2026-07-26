@@ -899,7 +899,16 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
         subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
         subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
 
-        for attempt in range(1, 4):
+        # ФИКС: было всего 3 попытки с фиксированной паузой 2 сек — этого
+        # мало для транзиентных конфликтов git push. Если все попытки
+        # проваливались, пост уже уходил в Telegram, а запись о нём в
+        # posted.json так и не попадала в git — следующий запуск не знал
+        # о публикации и мог отправить ту же новость повторно (см.
+        # скриншот с дублем СУ-34 от РИА Новости). Увеличиваем число
+        # попыток и делаем паузу растущей + со случайным джиттером, чтобы
+        # конфликтующие процессы не сталкивались раз за разом синхронно.
+        MAX_PUSH_ATTEMPTS = 8
+        for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
             fetch = subprocess.run(["git", "fetch", "origin", "main"], capture_output=True, text=True)
             if fetch.returncode != 0:
                 print(f"[WARN] git fetch failed (attempt {attempt}): {fetch.stderr}")
@@ -964,11 +973,14 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             if push.returncode == 0:
                 print("[INFO] State files committed and pushed.")
                 return
-            print(f"[WARN] git push failed (attempt {attempt}/3), retrying with fresh fetch: {push.stderr}")
-            time.sleep(2)
+            backoff = min(2 * (2 ** (attempt - 1)), 30) + random.uniform(0, 1.5)
+            print(f"[WARN] git push failed (attempt {attempt}/{MAX_PUSH_ATTEMPTS}), "
+                  f"retrying in {backoff:.1f}s with fresh fetch: {push.stderr}")
+            time.sleep(backoff)
 
-        print("[WARN] Could not push state after 3 attempts — next run may briefly re-see this item.")
-        raise RuntimeError("Failed to persist bot state to git after 3 attempts")
+        print(f"[WARN] Could not push state after {MAX_PUSH_ATTEMPTS} attempts — "
+              f"next run may briefly re-see this item.")
+        raise RuntimeError(f"Failed to persist bot state to git after {MAX_PUSH_ATTEMPTS} attempts")
     except Exception as e:
         print(f"[WARN] persist_state_to_git error: {e}")
         raise
