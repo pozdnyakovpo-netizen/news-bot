@@ -1,116 +1,132 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
+import re
 import json
 import time
+import html
+import uuid
+import random
 import hashlib
-import feedparser
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse, quote
+from datetime import datetime
 
-# ---------- Настройки ----------
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SEEN_FILE = "seen.json"
-MAX_SEEN_ITEMS = 500  # чтобы файл не рос бесконечно
+# --- Настройки ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")  # "Ключ авторизации" из личного кабинета Sber
+GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
+POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
+LAST_RUN_FILE = "last_run.json"    # хранит время последней успешной публикации
+PUBLISH_INTERVAL = 600             # сек, интервал между ОБЫЧНЫМИ публикациями (10 минут)
+URGENT_INTERVAL = 120              # сек, интервал между СРОЧНЫМИ публикациями (2 минуты)
+ITEMS_PER_RUN = 1                  # сколько реально публикуем за один допустимый запуск
+FETCH_POOL_SIZE = 12               # сколько кандидатов собрать перед выбором самой важной новости
+FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку страницы канала
+AI_CALL_DELAY = 1.5                # сек, пауза между вызовами GigaChat (анти-рейтлимит — увеличена из-за роста числа источников)
+SEND_DELAY = 1.5                   # сек, пауза между отправками отдельных постов (анти-флуд)
 
-# Список RSS-лент — впишите свои
-RSS_FEEDS = [
-    "https://www.example.com/rss",
+CHANNEL_USERNAME = "deepdailyfact"
+CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
+SHARE_URL = (
+    "https://t.me/share/url?url="
+    + quote(CHANNEL_LINK, safe="")
+    + "&text="
+    + quote("Нашёл крутой новостной канал — залетай 👇", safe="")
+)
+
+# Разные формулировки призыва поделиться — чтобы не приедалось при частой публикации
+CTA_VARIANTS = [
+    f"🚀 <a href=\"{SHARE_URL}\">Поделиться каналом с друзьями</a>",
+    f"📣 <a href=\"{SHARE_URL}\">Расскажи друзьям про канал</a>",
+    f"✉️ <a href=\"{SHARE_URL}\">Отправить другу</a>",
+    f"🔥 <a href=\"{SHARE_URL}\">Знаешь, кому это будет интересно? Поделись</a>",
 ]
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
+MILESTONES_FILE = "milestones.json"
+
+# Ключевые слова, по которым новость помечается как важная — влияет только на эмодзи, без текста.
+# Список специально узкий: если помечать срочным каждую новость про "атаку" или "обстрел",
+# метка перестаёт что-либо значить (как у каналов, где "🚨СРОЧНО🚨" стоит через пост).
+URGENT_KEYWORDS = [
+    "погиб", "убит", "жертв", "экстренн", "чрезвычайн", "эвакуац",
+    "взрыв", "теракт", "катастроф", "введен режим чс",
+]
+
+# Эмодзи-метки для важных новостей — выбирается случайно, без подписи "СРОЧНО"
+URGENT_EMOJIS = ["🔥", "🚨", "❗️", "⚡️"]
+
+# Единый эмодзи-маркер канала — стоит в начале КАЖДОГО поста, всегда один и тот же.
+# Со временем читатель узнаёт его в общей ленте подписок с первого взгляда,
+# даже не читая название канала — это и есть "почерк" канала.
+CHANNEL_MARK = "🔷"
 
 
-# ---------- Хранение истории ----------
-def load_seen():
-    if not os.path.exists(SEEN_FILE):
-        return set()
-    with open(SEEN_FILE, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-            return set(data)
-        except json.JSONDecodeError:
-            return set()
+def is_urgent(title, summary=""):
+    t = (title + " " + summary).lower()
+    return any(kw.lower() in t for kw in URGENT_KEYWORDS)
 
 
-def save_seen(seen_set):
-    # обрезаем, чтобы файл не рос бесконечно (оставляем последние N)
-    trimmed = list(seen_set)[-MAX_SEEN_ITEMS:]
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(trimmed, f, ensure_ascii=False, indent=2)
+# Признаки "не новостного" контента: лайфхаки, списки советов, гороскопы и т.п.
+# Такие статьи иногда попадают в общую RSS-ленту сайта вместе с настоящими новостями.
+NOT_NEWS_PATTERNS = [
+    "лайфхак", "топ-", "5 способов", "10 способов", "7 способов",
+    "5 причин", "10 причин", "5 признаков", "10 признаков",
+    "интересные факты", "полезные советы", "как выбрать", "как избавиться",
+    "чем опасен", "чем опасны", "чем полезен", "чем полезны", "рецепт",
+    "гороскоп", "приметы", "что будет если", "5 фактов", "10 фактов",
+    "простые способы", "правила ухода", "как правильно",
+    # лайфстайл/развлекательный контент — не новости в строгом смысле
+    "интервью", "колонка", "личный опыт", "рассказала о себе", "рассказал о себе",
+    "подкаст", "блог", "мнение:", "спросили у", "разбираем", "объясняем",
+    "путеводитель", "подборка", "рейтинг", "рекомендуем", "что посмотреть",
+    "что почитать", "что послушать", "тест-драйв", "обзор:",
+    # сводки из нескольких новостей сразу — не годятся под формат "одна новость = один пост":
+    # получаются рваные посты со списком через буллеты вместо связного текста
+    "главные новости дня", "главные новости к этому часу", "итоги дня",
+    "коротко о главном", "новости к этому часу", "главное к этому часу",
+    "дайджест",  # ловит "в нашем вечернем дайджесте", "дайджест дня" и т.п. — любой день недели
+]
+
+# Символы-маркеры списка, которыми РИА и похожие каналы оформляют сводки
+# из нескольких новостей в одном посте — если таких маркеров 2 и больше,
+# это точно не единичная новость, а дайджест, который не стоит публиковать как есть
+DIGEST_BULLET_CHARS = ["◆", "▪", "‣", "🔹", "🔸"]
 
 
-def make_id(entry):
-    # используем guid/link, а если их нет — хеш заголовка
-    raw = entry.get("id") or entry.get("link") or entry.get("title", "")
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def is_digest_post(text):
+    if any(text.count(ch) >= 2 for ch in DIGEST_BULLET_CHARS):
+        return True
+    # тире тоже часто используют как маркер списка ("— Трамп заявил... — Путин
+    # встретился... — ВСУ ударили...") — 3+ таких тире подряд означают список
+    # пунктов, а не связный рассказ об одном событии
+    if text.count(" — ") >= 3:
+        return True
+    return False
 
 
-# ---------- Получение новостей ----------
-def fetch_new_entries(seen_ids):
-    new_entries = []
-    for feed_url in RSS_FEEDS:
-        parsed = feedparser.parse(feed_url)
-        for entry in parsed.entries:
-            entry_id = make_id(entry)
-            if entry_id not in seen_ids:
-                new_entries.append((entry_id, entry))
-    return new_entries
+def is_not_news(title, summary=""):
+    t = (title + " " + summary).lower()
+    if any(p in t for p in NOT_NEWS_PATTERNS):
+        return True
+    if is_digest_post(title + " " + summary):
+        return True
+    return False
 
 
-def clean_html(raw_html):
-    soup = BeautifulSoup(raw_html or "", "html.parser")
-    return soup.get_text(separator=" ", strip=True)
+MAX_SENTENCES = 7  # максимум предложений в теле поста — только самое важное, без воды
 
 
-# ---------- Отправка в Telegram ----------
-def send_to_telegram(text):
-    resp = requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        print(f"[WARN] sendMessage failed: {resp.json()}")
-    return resp.ok
-
-
-# ---------- Основная логика ----------
-def main():
-    print(f"[START] {__import__('datetime').datetime.utcnow().isoformat()}")
-
-    seen_ids = load_seen()
-    new_entries = fetch_new_entries(seen_ids)
-
-    if not new_entries:
-        print("[INFO] No new news.")
-        return
-
-    for entry_id, entry in new_entries:
-        title = entry.get("title", "Без заголовка")
-        summary = clean_html(entry.get("summary", ""))
-        link = entry.get("link", "")
-
-        text = f"<b>{title}</b>\n\n{summary[:500]}\n\n{link}"
-
-        ok = send_to_telegram(text)
-        if ok:
-            seen_ids.add(entry_id)
-            print(f"[INFO] Posted: {title}")
-        else:
-            print(f"[WARN] Failed to post: {title}")
-
-        time.sleep(1)  # чтобы не упереться в rate limit Telegram
-
-    save_seen(seen_ids)
-    print(f"[DONE] Posted {len(new_entries)} new items.")
-
-
-if __name__ == "__main__":
-    main()
+def limit_sentences(text, max_sentences=MAX_SENTENCES):
+    """Обрезает текст по границе предложения, а не посимвольно —
+    чтобы пост не заканчивался на середине слова/м
