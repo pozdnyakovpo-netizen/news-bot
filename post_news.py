@@ -245,13 +245,24 @@ def significant_title_words(title):
     return words
 
 
-def titles_are_similar(words_a, words_b, threshold=0.5):
+def titles_are_similar(words_a, words_b, threshold=0.6):
+    # Раньше здесь считался коэффициент Жаккара (общие / ВСЕ слова обоих
+    # заголовков) — он занижает похожесть для коротких заголовков, когда у
+    # одного источника на 1-2 слова больше ("из-за непогоды" против "из-за
+    # мощного шторма"), даже если речь об одном и том же событии. Реальный
+    # случай: "Один человек погиб, еще 13 пострадали из-за мощного шторма"
+    # (readovkanews) и "Один человек погиб, 13 пострадали из-за непогоды"
+    # (rian_ru) — Жаккар давал ~0.5 и не всегда ловил дубль, из-за чего
+    # одна и та же новость от двух каналов публиковалась дважды.
+    # Теперь считаем коэффициент перекрытия: общие слова / слова в БОЛЕЕ
+    # КОРОТКОМ заголовке — если короткий заголовок почти целиком содержится
+    # в длинном, это тот же самый факт, рассказанный чуть подробнее.
     if not words_a or not words_b:
         return False
-    union = words_a | words_b
-    if not union:
+    smaller = min(len(words_a), len(words_b))
+    if smaller == 0:
         return False
-    return (len(words_a & words_b) / len(union)) >= threshold
+    return (len(words_a & words_b) / smaller) >= threshold
 
 
 RECENT_TITLES_FILE = "recent_titles.json"
