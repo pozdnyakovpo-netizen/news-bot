@@ -499,9 +499,19 @@ def content_words(title, summary):
 # и позволяет распознать дубль даже при низком общем словесном
 # перекрытии (см. кейс "эвакуированы тела" / "погibли двое альпинистов"
 # на Эльбрусе — общих слов мало, но оба содержат "Эльбрус").
+# ФИКС: список расширен — "Трамп", "Зеленский", "Германия", "Берлин" и
+# другие геополитические имена настолько часто встречаются в разных,
+# никак не связанных друг с другом новостях, что раньше (без них в
+# стоп-листе) почти любая пара новостей с упоминанием, например, Трампа
+# считалась "тем же событием" — из-за чего целый прогон однажды отбросил
+# ВСЕ 68 кандидатов пула как дубли, хотя они были о совершенно разных
+# вещах. Список статический, но ниже добавлена ДИНАМИЧЕСКАЯ защита
+# (compute_common_entity_stems), которая ловит подобное автоматически,
+# не дожидаясь, пока конкретное имя внесут в список руками.
 COMMON_ENTITY_STOPWORD_STEMS = {
     "росси", "москв", "украи", "путин", "минюс", "госдум", "кремл",
-    "россия", "мчс", "мвд", "фсб", "цб",
+    "россия", "мчс", "мвд", "фсб", "цб", "трамп", "зеленс", "герман",
+    "берлин", "нато", "израил", "евросо", "вашинг", "белый",
 }
 
 
@@ -521,6 +531,28 @@ def extract_entity_stems(text):
     return stems
 
 
+def compute_common_entity_stems(recent_posts, min_count=5, max_fraction=0.15):
+    # РАДИКАЛЬНЫЙ ФИКС: вместо того чтобы вручную и бесконечно пополнять
+    # статический список "слишком общих" имён (что мы уже дважды делали —
+    # для "ии" и для "гол"/"лига", теперь для "Трамп"/"Германия"), считаем
+    # частоту каждого именного стема по РЕАЛЬНОЙ недавней истории постов.
+    # Стем, который встречается больше чем в max_fraction всех недавних
+    # постов (и не реже min_count раз), считается "фоновым словом", а не
+    # уникальным идентификатором конкретного события, и исключается из
+    # сравнения — это адаптируется само по себе к любой новой часто
+    # повторяющейся теме, а не только к тем именам, что мы уже заметили.
+    if not recent_posts:
+        return set()
+    counter = {}
+    for post in recent_posts:
+        stems = extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))
+        for stem in stems:
+            counter[stem] = counter.get(stem, 0) + 1
+    total = len(recent_posts)
+    threshold = max(min_count, total * max_fraction)
+    return {stem for stem, count in counter.items() if count >= threshold}
+
+
 def titles_are_similar(words_a, words_b, threshold=0.5):
     # Коэффициент перекрытия: общие слова / слова в БОЛЕЕ КОРОТКОМ наборе —
     # если меньший набор почти целиком содержится в большем, речь об одном
@@ -535,18 +567,22 @@ def titles_are_similar(words_a, words_b, threshold=0.5):
     return (len(words_a & words_b) / smaller) >= threshold
 
 
-def is_same_event(title_a, summary_a, title_b, summary_b):
+def is_same_event(title_a, summary_a, title_b, summary_b, exclude_entities=None):
     # Комбинированная проверка: сначала обычный порог (0.5), а если он не
     # пройден — смотрим, есть ли общий именной стем (см. выше); если да,
     # порог резко снижается (0.15), потому что совпадение конкретного
     # места/персоны — уже само по себе сильное доказательство того же
     # события, даже если остальные слова текста совсем разные.
+    # exclude_entities — стемы, которые слишком часто встречаются в
+    # недавней истории (см. compute_common_entity_stems), чтобы считаться
+    # уникальным признаком конкретного события — их не учитываем.
     words_a = content_words(title_a, summary_a)
     words_b = content_words(title_b, summary_b)
     if titles_are_similar(words_a, words_b, threshold=0.5):
         return True
-    entities_a = extract_entity_stems(title_a) | extract_entity_stems(summary_a)
-    entities_b = extract_entity_stems(title_b) | extract_entity_stems(summary_b)
+    exclude_entities = exclude_entities or set()
+    entities_a = (extract_entity_stems(title_a) | extract_entity_stems(summary_a)) - exclude_entities
+    entities_b = (extract_entity_stems(title_b) | extract_entity_stems(summary_b)) - exclude_entities
     if entities_a & entities_b and titles_are_similar(words_a, words_b, threshold=0.15):
         return True
     return False
@@ -600,12 +636,13 @@ def save_recent_posts(posts):
     _save_json(RECENT_POSTS_FILE, trimmed)
 
 
-def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts):
+def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts, exclude_entities=None):
     # Уровень B применительно к реально опубликованным постам (не только
     # к текущему пулу кандидатов) — без вызова ИИ, бесплатно и мгновенно.
     for post in recent_posts:
         if is_same_event(candidate_title, candidate_summary,
-                          post.get("headline", ""), post.get("summary", "")):
+                          post.get("headline", ""), post.get("summary", ""),
+                          exclude_entities=exclude_entities):
             return True
     return False
 
@@ -614,14 +651,18 @@ STORY_CONTINUATION_WINDOW_HOURS = 48
 
 
 def find_story_continuation(candidate_title, candidate_summary, recent_posts,
-                             hours=STORY_CONTINUATION_WINDOW_HOURS):
+                             hours=STORY_CONTINUATION_WINDOW_HOURS, exclude_entities=None):
     # "Продолжение истории": кандидат уже ПРОШЁЛ проверку на дубликат (иначе
     # его бы не публиковали вовсе) — эта функция не про дедуп, а про то,
     # чтобы связать НОВУЮ, но связанную новость с предыдущим постом на ту же
     # тему/место/персону (общий именной стем), опубликованным недавно.
     # Ищем самое СВЕЖЕЕ совпадение — если их несколько, ссылаемся на
     # последний пост по теме, а не на самый первый.
-    c_entities = extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)
+    # exclude_entities — см. compute_common_entity_stems: без этого
+    # "Трамп"/"Германия" и т.п. связывали бы совершенно не связанные
+    # новости пометкой "продолжение истории".
+    exclude_entities = exclude_entities or set()
+    c_entities = (extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)) - exclude_entities
     if not c_entities:
         return None
     now = time.time()
@@ -632,7 +673,7 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
         ts = post.get("ts")
         if ts and now - ts > hours * 3600:
             continue
-        p_entities = extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))
+        p_entities = (extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))) - exclude_entities
         if c_entities & p_entities:
             best = post  # recent_posts в порядке добавления — последнее совпадение самое свежее
     return best
@@ -1139,6 +1180,7 @@ def pick_non_duplicate(items):
     posted_now = load_posted()
     recent_now = load_recent_title_words()
     recent_posts_now = load_recent_posts()
+    common_entities = compute_common_entity_stems(recent_posts_now)
     ai_checks_used = 0
     for it in items:
         if it["id"] in posted_now or it["title_key"] in posted_now:
@@ -1146,7 +1188,8 @@ def pick_non_duplicate(items):
         cw = set(it.get("content_words") or [])
         if cw and is_duplicate_by_meaning(cw, recent_now):
             continue
-        if is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_now):
+        if is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_now,
+                                        exclude_entities=common_entities):
             print(f"[INFO] '{it['title'][:50]}' — дубль по именному стему, пропускаем.")
             continue
         if ai_checks_used < MAX_AI_DEDUPE_CHECKS:
@@ -1915,9 +1958,11 @@ def main():
         # так собирает до 5 новостей, дороже по времени/токенам смысла
         # мало, Уровня B обычно достаточно для этого сценария.
         recent_posts_for_digest = load_recent_posts()
+        common_entities_digest = compute_common_entity_stems(recent_posts_for_digest)
         digest_items = [
             it for it in digest_items
-            if not is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_for_digest)
+            if not is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_for_digest,
+                                                exclude_entities=common_entities_digest)
         ]
         digest_items = digest_items[:DIGEST_SIZE]
 
@@ -2060,8 +2105,10 @@ def main():
     # выше — если он всё же связан с недавним постом (общее место/персона),
     # добавим ссылку на предыдущий пост вместо того, чтобы публиковать
     # несвязанные друг с другом посты об одном и том же сюжете.
+    _recent_posts_for_continuation = load_recent_posts()
     chosen["continuation_of"] = find_story_continuation(
-        chosen["title"], chosen.get("summary", ""), load_recent_posts()
+        chosen["title"], chosen.get("summary", ""), _recent_posts_for_continuation,
+        exclude_entities=compute_common_entity_stems(_recent_posts_for_continuation),
     )
 
     chosen = finalize_item(chosen)
