@@ -113,8 +113,31 @@ DIGEST_WINDOW_MINUTES = 4           # окно срабатывания (cron р
 DIGEST_STATE_FILE = "last_digest.json"
 
 POLL_TIME = "12:00"  # МСК, время ежедневного вовлекающего опроса
-POLL_QUESTION = "Какая тема сейчас интереснее всего?"
-POLL_OPTIONS = ["Политика", "Происшествия", "Спорт", "Технологии", "Экономика"]
+# ФИКС: было 4 варианта — теперь несколько вариантов, ротируются по дню,
+# чтобы подписчики не видели один и тот же вопрос каждый день.
+POLL_VARIANTS = [
+    {"question": "Какая тема сейчас интереснее всего?",
+     "options": ["Политика", "Происшествия", "Спорт", "Технологии", "Экономика"]},
+    {"question": "Что для вас важнее всего в новостях?",
+     "options": ["Скорость", "Точность фактов", "Без рекламы", "Разнообразие тем"]},
+    {"question": "Как часто хотите видеть дайджест?",
+     "options": ["Чаще", "Как сейчас — 2 раза в день", "Реже", "Только срочные новости"]},
+    {"question": "Каких новостей хотелось бы больше?",
+     "options": ["Происшествия", "Экономика", "Международные", "Всё устраивает"]},
+]
+
+
+def pick_poll_variant(day_key):
+    # ФИКС: встроенный hash() в Python рандомизируется между запусками
+    # процесса (PYTHONHASHSEED) — на GitHub Actions каждый запуск это новый
+    # процесс, так что hash(day_key) был бы разным при каждом прогоне, а не
+    # стабильным в течение дня. hashlib.md5 даёт одинаковый результат
+    # всегда для одного и того же day_key, независимо от процесса.
+    digest = hashlib.md5(day_key.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(POLL_VARIANTS)
+    return POLL_VARIANTS[idx]
+
+
 POLL_STATE_FILE = "last_poll.json"
 
 CHANNEL_REACTIONS = ["👍", "🔥", "😱", "😢", "🤔"]
@@ -562,7 +585,9 @@ def is_duplicate_by_meaning(words, recent_word_sets):
 # тела) последних опубликованных постов — это даёт материал и для
 # entity-проверки, и для смысловой проверки через GigaChat.
 RECENT_POSTS_FILE = "recent_posts.json"
-RECENT_POSTS_LIMIT = 30
+RECENT_POSTS_LIMIT = 300  # было 30 — увеличено, чтобы (а) дедуп уровня B/C
+                          # видел более длинную историю и (б) было из чего
+                          # собирать еженедельный рекап "Главное за неделю"
 
 
 def load_recent_posts():
@@ -1373,6 +1398,92 @@ def send_poll_to_telegram(question, options):
         return False
 
 
+# --- Еженедельный рекап "Главное за неделю" ---
+WEEKLY_RECAP_WEEKDAY = 6         # 0=понедельник ... 6=воскресенье (МСК)
+WEEKLY_RECAP_TIME = "20:00"      # МСК
+WEEKLY_RECAP_WINDOW_MINUTES = 4
+WEEKLY_RECAP_STATE_FILE = "weekly_recap_state.json"
+WEEKLY_RECAP_MAX_ITEMS = 7
+
+
+def week_key_for(dt):
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def due_weekly_recap(dt, current_week_key, state):
+    if state.get("week_key") == current_week_key and state.get("sent"):
+        return False
+    if dt.weekday() != WEEKLY_RECAP_WEEKDAY:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, WEEKLY_RECAP_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= WEEKLY_RECAP_WINDOW_MINUTES
+
+
+def pick_weekly_recap_items(recent_posts, max_items=WEEKLY_RECAP_MAX_ITEMS):
+    # Берём посты за последние 7 дней (по ts, если он есть — старые записи
+    # без ts, оставшиеся от версии до этого фикса, просто не отфильтровываем
+    # агрессивно, чтобы не остаться совсем без материала первую неделю).
+    now = time.time()
+    week_posts = [p for p in recent_posts if not p.get("ts") or now - p["ts"] <= 7 * 24 * 3600]
+    if not week_posts:
+        week_posts = recent_posts
+    candidates = week_posts[-100:]  # ограничиваем размер промпта разумным пределом
+    if not candidates:
+        return []
+    if len(candidates) <= max_items:
+        return candidates
+
+    token = get_gigachat_token()
+    if not token:
+        return candidates[-max_items:]
+    try:
+        listing = "\n".join(
+            f"{i}. {p.get('headline', '')} — {p.get('summary', '')[:100]}"
+            for i, p in enumerate(candidates)
+        )
+        prompt = (
+            f"Ниже список новостей, опубликованных каналом за последнюю неделю. "
+            f"Выбери {max_items} самых важных и значимых для еженедельного "
+            f"рекапа — по возможности из разных тем, а не всё об одном. "
+            f"Ответь СТРОГО номерами через запятую, без пояснений, "
+            f"например: 2,5,9,14,20,33,41\n\n" + listing
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 60,
+        }
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 15))
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        indices = [int(x) for x in re.findall(r'\d+', answer)][:max_items]
+        chosen = [candidates[i] for i in indices if 0 <= i < len(candidates)]
+        return chosen if chosen else candidates[-max_items:]
+    except Exception as e:
+        print(f"[WARN] pick_weekly_recap_items error: {e}")
+        return candidates[-max_items:]
+
+
+def format_weekly_recap(items):
+    lines = [f"{CHANNEL_MARK} <b>Главное за неделю</b>", ""]
+    for i, p in enumerate(items, 1):
+        cat_emoji, _ = detect_category(p.get("headline", ""), p.get("summary", ""))
+        headline = html.escape(truncate_at_word(p.get("headline", "")))
+        lines.append(f"{i}. {cat_emoji} {headline}")
+    lines.append("")
+    lines.append(random.choice(CTA_VARIANTS))
+    return "\n".join(lines).strip()
+
+
 def enable_reactions():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
@@ -1412,7 +1523,7 @@ def format_digest(items, slot_label):
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
-    ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE,
+    ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
 ]
 
 
@@ -1429,7 +1540,7 @@ def _git_show_json(ref_path, default):
 
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None, new_reactions_enabled=None,
-                          new_alert_timestamp=None, new_status=None):
+                          new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
@@ -1465,6 +1576,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_milestones = _git_show_json(f"origin/main:{MILESTONES_FILE}", {"last": 0})
             remote_digest = _git_show_json(f"origin/main:{DIGEST_STATE_FILE}", {"date": None, "slots": []})
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
+            remote_weekly_recap = _git_show_json(f"origin/main:{WEEKLY_RECAP_STATE_FILE}", {"week_key": None, "sent": False})
             remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
@@ -1510,6 +1622,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
 
             merged_digest = new_digest_state if new_digest_state is not None else remote_digest
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
+            merged_weekly_recap = new_weekly_recap_state if new_weekly_recap_state is not None else remote_weekly_recap
             merged_reactions = {
                 "enabled": bool(new_reactions_enabled) or bool(remote_reactions.get("enabled"))
             }
@@ -1530,6 +1643,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             save_last_milestone(merged_milestones["last"])
             _save_json(DIGEST_STATE_FILE, merged_digest)
             _save_json(POLL_STATE_FILE, merged_poll)
+            _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
             _save_json(REACTIONS_STATE_FILE, merged_reactions)
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
@@ -1592,14 +1706,33 @@ def main():
         poll_state = {"date": day_key, "sent": False}
     new_poll_state = None
     if due_poll(dt_msk, poll_state.get("sent")):
-        if send_poll_to_telegram(POLL_QUESTION, POLL_OPTIONS):
+        variant = pick_poll_variant(day_key)
+        if send_poll_to_telegram(variant["question"], variant["options"]):
             poll_state["sent"] = True
             new_poll_state = poll_state
-            print("[INFO] Engagement poll sent.")
+            print(f"[INFO] Engagement poll sent: '{variant['question']}'")
 
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
+
+    # --- Еженедельный рекап "Главное за неделю" ---
+    week_key = week_key_for(dt_msk)
+    weekly_recap_state = _load_json(WEEKLY_RECAP_STATE_FILE, {"week_key": None, "sent": False})
+    new_weekly_recap_state = None
+    if due_weekly_recap(dt_msk, week_key, weekly_recap_state):
+        recap_items = pick_weekly_recap_items(load_recent_posts())
+        if recap_items:
+            recap_text = format_weekly_recap(recap_items)
+            if send_to_telegram(recap_text):
+                new_weekly_recap_state = {"week_key": week_key, "sent": True}
+                print(f"[INFO] Weekly recap sent: {len(recap_items)} items.")
+        else:
+            # Нечего показывать (например, самая первая неделя работы бота) —
+            # всё равно помечаем неделю пройденной, чтобы не пытаться на
+            # каждом следующем тике воскресенья в это же окно.
+            new_weekly_recap_state = {"week_key": week_key, "sent": True}
+            print("[INFO] No material for weekly recap, marking week as done anyway.")
 
     # --- Дайджест по расписанию (утро/вечер) ---
     digest_state = _load_json(DIGEST_STATE_FILE, {"date": None, "slots": []})
@@ -1655,6 +1788,7 @@ def main():
                     new_recent_posts_entries.append({
                         "headline": it.get("title", ""),
                         "summary": it.get("summary", ""),
+                        "ts": time.time(),
                     })
                 save_posted(posted)
                 save_recent_title_words(recent_words)
@@ -1673,6 +1807,7 @@ def main():
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                     new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
                 )
                 print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
                 return
@@ -1689,24 +1824,26 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
             )
         return
 
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
             persist_with_status(
                 note="skip:no_news",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
             )
         return
 
@@ -1723,12 +1860,13 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                     new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
                 )
             return
         normal_items = prefer_video(normal_items)
@@ -1743,12 +1881,13 @@ def main():
     chosen = pick_non_duplicate(ordered)
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
             )
         return
 
@@ -1777,6 +1916,7 @@ def main():
             save_recent_posts(load_recent_posts() + [{
                 "headline": item.get("title", ""),
                 "summary": item.get("summary", ""),
+                "ts": time.time(),
             }])
             sent_count += 1
             time.sleep(SEND_DELAY)
@@ -1797,6 +1937,7 @@ def main():
         new_digest_state=new_digest_state,
         new_poll_state=new_poll_state,
         new_reactions_enabled=new_reactions_enabled,
+                new_weekly_recap_state=new_weekly_recap_state,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
