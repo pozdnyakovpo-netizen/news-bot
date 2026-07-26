@@ -771,7 +771,14 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
             remote_milestones = _git_show_json(f"origin/main:{MILESTONES_FILE}", {"last": 0})
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
-            merged_recent = [set(w) for w in remote_recent]
+            merged_recent = []
+            for w in remote_recent:
+                if not isinstance(w, list):
+                    continue
+                try:
+                    merged_recent.append(set(x for x in w if isinstance(x, str)))
+                except TypeError:
+                    continue
             if new_title_words:
                 merged_recent.append(set(new_title_words))
             merged_recent = merged_recent[-RECENT_TITLES_LIMIT:]
