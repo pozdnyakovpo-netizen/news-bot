@@ -686,7 +686,7 @@ def rewrite_with_ai(title, summary):
         return None
     try:
         prompt_lines = [
-            "Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 2 частях.",
+            "Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 3 частях.",
             "",
             "1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце. "
             "Старайся уложиться в 60-80 символов, но ГЛАВНОЕ ПРАВИЛО: заголовок "
@@ -698,6 +698,12 @@ def rewrite_with_ai(title, summary):
             "главное последствие. Без второстепенных деталей, без предыстории и лишних "
             "подробностей — только суть. Одно предложение — одна мысль, без вложенных "
             "оборотов через запятую.",
+            "3) КОНТЕКСТ — ОДНО короткое предложение (до 15 слов), объясняющее, "
+            "почему это важно или что это значит на практике для читателя "
+            "(например: сколько людей это затронет, это уже который случай за "
+            "период, к чему это может привести). Это НЕ пересказ новости другими "
+            "словами — если добавить нечего (нет очевидного практического "
+            "следствия), напиши ровно слово 'нет', не выдумывай значимость.",
             "",
             "ВАЖНО: если в исходной новости событие описано как предположение, план или "
             "условие (может быть, планируется, по данным источника, предположительно) — "
@@ -719,6 +725,7 @@ def rewrite_with_ai(title, summary):
             "Ответь строго в формате:",
             "ЗАГОЛОВОК: <текст>",
             "ТЕКСТ: <текст>",
+            "КОНТЕКСТ: <текст или 'нет'>",
         ]
         prompt = "\n".join(prompt_lines)
 
@@ -754,11 +761,20 @@ def rewrite_with_ai(title, summary):
         time.sleep(AI_CALL_DELAY)
 
         headline_match = re.search(r"ЗАГОЛОВОК:\s*(.+)", answer)
-        body_match = re.search(r"ТЕКСТ:\s*(.+)", answer, re.S)
+        # ФИКС: без нелчадности (?=...) старый regex с re.S жадно захватывал
+        # ВСЁ до конца строки, включая последующую строку КОНТЕКСТ: — теперь
+        # текст останавливается перед меткой КОНТЕКСТ: или концом ответа.
+        body_match = re.search(r"ТЕКСТ:\s*(.+?)(?=\n\s*КОНТЕКСТ:|\Z)", answer, re.S)
+        context_match = re.search(r"КОНТЕКСТ:\s*(.+)", answer)
         if headline_match and body_match:
             headline = headline_match.group(1).strip()
             body = body_match.group(1).strip()
-            return {"headline": headline, "body": body}
+            context_line = None
+            if context_match:
+                raw_context = context_match.group(1).strip().rstrip(".")
+                if raw_context and raw_context.lower() not in ("нет", "нету", "-", "—"):
+                    context_line = raw_context
+            return {"headline": headline, "body": body, "context": context_line}
         return None
     except Exception as e:
         print(f"[ERROR] GigaChat rewrite error: {e}")
@@ -1024,6 +1040,17 @@ def finalize_item(item):
     # Признак 5: короткая атрибуция источника в конце поста — просто
     # @handle канала-первоисточника, без ссылки и без цитирования текста.
     item["attribution"] = item.get("source") if item.get("source_channel") else None
+
+    # "Почему это важно" — контекстная строка от AI (см. rewrite_with_ai).
+    # Только для НЕсрочных постов: у срочных и так формат-"молния", лишняя
+    # строка там мешает мгновенному считыванию сути.
+    context_raw = rewritten.get("context") if rewritten else None
+    if context_raw and not item.get("urgent"):
+        context_raw = fix_shouty_caps(strip_cliche_openers(sanitize_text(context_raw)))
+        item["context_line"] = html.escape(truncate_at_word(context_raw, 150)) if context_raw else None
+    else:
+        item["context_line"] = None
+
     return item
 
 
@@ -1212,6 +1239,12 @@ def format_post(item, extra=""):
     text = f"{mark} <b>{item['headline']}</b>"
     if item.get("body"):
         text += f"\n\n{item['body']}"
+
+    # "Почему это важно" — короткая контекстная строка от AI, не пересказ,
+    # а объяснение значимости/следствия. Только если AI реально нашёл, что
+    # сказать (rewrite_with_ai возвращает None, если добавить нечего).
+    if item.get("context_line"):
+        text += f"\n\n💡 {item['context_line']}"
 
     # Признак 6: если новость независимо подтвердили 2+ разных канала в
     # пуле кандидатов — это реальный сигнал достоверности, как у крупных
