@@ -468,6 +468,36 @@ def content_words(title, summary):
     return significant_title_words(title) | significant_words(summary)
 
 
+# УРОВЕНЬ B дедупа (без ИИ, бесплатно): "именные" стемы — слова с
+# заглавной буквы не в начале фразы почти всегда имена/топонимы
+# ("Эльбрус", "Одесса"), а не случайное слово. Если у двух новостей
+# совпадает такой стем — это гораздо более сильный сигнал одного
+# события, чем совпадение обычных слов ("погиб", "человек" и т.п.),
+# и позволяет распознать дубль даже при низком общем словесном
+# перекрытии (см. кейс "эвакуированы тела" / "погibли двое альпинистов"
+# на Эльбрусе — общих слов мало, но оба содержат "Эльбрус").
+COMMON_ENTITY_STOPWORD_STEMS = {
+    "росси", "москв", "украи", "путин", "минюс", "госдум", "кремл",
+    "россия", "мчс", "мвд", "фсб", "цб",
+}
+
+
+def extract_entity_stems(text):
+    if not text:
+        return set()
+    words = re.findall(r'[А-ЯЁ][а-яё]+', text)
+    stems = set()
+    for w in words:
+        wl = w.lower()
+        if len(wl) <= 3 or wl in TITLE_STOPWORDS:
+            continue
+        stem = wl[:6] if len(wl) > 6 else wl
+        if stem in COMMON_ENTITY_STOPWORD_STEMS:
+            continue
+        stems.add(stem)
+    return stems
+
+
 def titles_are_similar(words_a, words_b, threshold=0.5):
     # Коэффициент перекрытия: общие слова / слова в БОЛЕЕ КОРОТКОМ наборе —
     # если меньший набор почти целиком содержится в большем, речь об одном
@@ -480,6 +510,23 @@ def titles_are_similar(words_a, words_b, threshold=0.5):
     if smaller == 0:
         return False
     return (len(words_a & words_b) / smaller) >= threshold
+
+
+def is_same_event(title_a, summary_a, title_b, summary_b):
+    # Комбинированная проверка: сначала обычный порог (0.5), а если он не
+    # пройден — смотрим, есть ли общий именной стем (см. выше); если да,
+    # порог резко снижается (0.15), потому что совпадение конкретного
+    # места/персоны — уже само по себе сильное доказательство того же
+    # события, даже если остальные слова текста совсем разные.
+    words_a = content_words(title_a, summary_a)
+    words_b = content_words(title_b, summary_b)
+    if titles_are_similar(words_a, words_b, threshold=0.5):
+        return True
+    entities_a = extract_entity_stems(title_a) | extract_entity_stems(summary_a)
+    entities_b = extract_entity_stems(title_b) | extract_entity_stems(summary_b)
+    if entities_a & entities_b and titles_are_similar(words_a, words_b, threshold=0.15):
+        return True
+    return False
 
 
 RECENT_TITLES_FILE = "recent_titles.json"
@@ -508,9 +555,100 @@ def is_duplicate_by_meaning(words, recent_word_sets):
     return any(titles_are_similar(words, other) for other in recent_word_sets)
 
 
+# УРОВЕНЬ B/C дедупа: раньше "память" дедупа хранила только наборы слов
+# (без исходного текста), поэтому не было возможности сравнить именные
+# стемы или спросить ИИ про смысл — приходилось восстанавливать текст
+# из ничего. Теперь дополнительно храним сам текст (заголовок + начало
+# тела) последних опубликованных постов — это даёт материал и для
+# entity-проверки, и для смысловой проверки через GigaChat.
+RECENT_POSTS_FILE = "recent_posts.json"
+RECENT_POSTS_LIMIT = 30
+
+
+def load_recent_posts():
+    raw = _load_json(RECENT_POSTS_FILE, [])
+    return [p for p in raw if isinstance(p, dict) and p.get("headline")]
+
+
+def save_recent_posts(posts):
+    trimmed = posts[-RECENT_POSTS_LIMIT:]
+    _save_json(RECENT_POSTS_FILE, trimmed)
+
+
+def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts):
+    # Уровень B применительно к реально опубликованным постам (не только
+    # к текущему пулу кандидатов) — без вызова ИИ, бесплатно и мгновенно.
+    for post in recent_posts:
+        if is_same_event(candidate_title, candidate_summary,
+                          post.get("headline", ""), post.get("summary", "")):
+            return True
+    return False
+
+
+MAX_AI_DEDUPE_CHECKS = 5  # ограничиваем число вызовов ИИ на дедуп за один запуск
+
+
+def check_semantic_duplicate_via_ai(candidate_title, candidate_summary, recent_posts):
+    # УРОВЕНЬ C (радикальный): если словарная проверка и проверка по
+    # именным стемам не нашли дубль, но новость всё равно может
+    # описывать то же самое событие совершенно другими словами (разный
+    # акцент: "эвакуировали тела" vs "погибли на восхождении") — это
+    # единственный способ поймать такой случай: спросить сам GigaChat.
+    # Дороже по времени/токенам, поэтому вызывается только для реально
+    # выбранного кандидата перед отправкой, а не для всего пула.
+    token = get_gigachat_token()
+    if not token or not recent_posts:
+        return None
+    try:
+        listing = "\n".join(
+            f"{i}. {p.get('headline', '')} — {p.get('summary', '')[:150]}"
+            for i, p in enumerate(recent_posts)
+        )
+        prompt = (
+            "Вот новость-кандидат для публикации в новостном канале:\n"
+            f"Заголовок: {candidate_title}\n"
+            f"Текст: {(candidate_summary or '')[:300]}\n\n"
+            "А вот пронумерованный список уже опубликованных в этом канале "
+            "недавних постов:\n" + listing + "\n\n"
+            "Описывает ли новость-кандидат ТО ЖЕ САМОЕ реальное событие, что "
+            "и один из уже опубликованных постов — даже если сформулировано "
+            "совершенно другими словами и с другим акцентом (например, один "
+            "текст про эвакуацию тел погибших, а другой — про сам факт их "
+            "гибели на том же месте: это одно и то же событие)? "
+            "Ответь СТРОГО одним словом или числом: номер поста, если да, "
+            "иначе слово 'нет'. Без пояснений."
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 10,
+        }
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 15))
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().lower()
+        if "нет" in answer and not re.search(r'\d', answer):
+            return None
+        match = re.search(r'\d+', answer)
+        if match:
+            idx = int(match.group())
+            if 0 <= idx < len(recent_posts):
+                return idx
+        return None
+    except Exception as e:
+        print(f"[WARN] check_semantic_duplicate_via_ai error: {e}")
+        return None
+
+
 def seconds_since_last_publish():
     last_publish = _load_json(LAST_RUN_FILE, {}).get("last_publish")
     return (time.time() - last_publish) if last_publish else None
+
 
 
 def mark_published_now():
@@ -908,16 +1046,39 @@ def pick_non_duplicate(items):
     # только что отработал дайджест и опубликовал что-то очень похожее на
     # нашего кандидата. Перечитываем posted/recent прямо перед отправкой и
     # берём первого кандидата, который всё ещё не дубликат.
+    #
+    # РАДИКАЛЬНЫЙ ФИКС (3 уровня, от дешёвого к дорогому):
+    #   A. точный хэш заголовка / пересечение словарных стемов (было)
+    #   B. пересечение "именных" стемов (Эльбрус, Одесса...) с более
+    #      низким порогом — ловит одно событие, описанное разными
+    #      словами, но упомянувшее общее место/персону
+    #   C. смысловая проверка через GigaChat против РЕАЛЬНО
+    #      опубликованных постов (а не только текущего пула) — ловит
+    #      случаи, когда даже общих именных стемов нет, но по смыслу
+    #      это то же самое событие
     posted_now = load_posted()
     recent_now = load_recent_title_words()
+    recent_posts_now = load_recent_posts()
+    ai_checks_used = 0
     for it in items:
         if it["id"] in posted_now or it["title_key"] in posted_now:
             continue
         cw = set(it.get("content_words") or [])
         if cw and is_duplicate_by_meaning(cw, recent_now):
             continue
+        if is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_now):
+            print(f"[INFO] '{it['title'][:50]}' — дубль по именному стему, пропускаем.")
+            continue
+        if ai_checks_used < MAX_AI_DEDUPE_CHECKS:
+            ai_checks_used += 1
+            dup_idx = check_semantic_duplicate_via_ai(it["title"], it.get("summary", ""), recent_posts_now)
+            if dup_idx is not None:
+                print(f"[INFO] GigaChat считает '{it['title'][:50]}' тем же событием, "
+                      f"что и недавний пост #{dup_idx} — пропускаем.")
+                continue
         return it
     return None
+
 
 
 def send_to_telegram(text):
@@ -1249,7 +1410,7 @@ def format_digest(items, slot_label):
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
-    ALERT_STATE_FILE, STATUS_FILE,
+    ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE,
 ]
 
 
@@ -1304,6 +1465,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
             remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
+            remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -1325,6 +1487,24 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
 
             local_milestone = load_last_milestone()
             merged_milestones = {"last": max(remote_milestones.get("last", 0), local_milestone)}
+
+            # recent_posts.json уже дописан локально (main() вызывает
+            # save_recent_posts до persist_state_to_git) — читаем его
+            # ДО git reset --hard, точно так же, как local_milestone выше,
+            # и мёржим с версией из origin/main по ключу (headline, summary),
+            # чтобы не потерять записи, добавленные другим успевшим запуском.
+            local_recent_posts = load_recent_posts()
+            seen_keys = set()
+            merged_recent_posts = []
+            for post in (list(remote_recent_posts) + local_recent_posts):
+                if not isinstance(post, dict) or not post.get("headline"):
+                    continue
+                key = (post.get("headline"), post.get("summary"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged_recent_posts.append(post)
+            merged_recent_posts = merged_recent_posts[-RECENT_POSTS_LIMIT:]
 
             merged_digest = new_digest_state if new_digest_state is not None else remote_digest
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
@@ -1351,6 +1531,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(REACTIONS_STATE_FILE, merged_reactions)
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
+            _save_json(RECENT_POSTS_FILE, merged_recent_posts)
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -1428,6 +1609,18 @@ def main():
     if slot:
         digest_items = fetch_news()
         digest_items.sort(key=lambda it: not it.get("urgent"))  # срочные — в начало
+
+        # РАДИКАЛЬНЫЙ ФИКС: та же проверка по словам+именным стемам
+        # (Уровень B), что и в pick_non_duplicate — без неё дайджест мог
+        # включить новость, уже опубликованную одиночным постом другими
+        # словами. ИИ-проверку (Уровень C) здесь не делаем — дайджест и
+        # так собирает до 5 новостей, дороже по времени/токенам смысла
+        # мало, Уровня B обычно достаточно для этого сценария.
+        recent_posts_for_digest = load_recent_posts()
+        digest_items = [
+            it for it in digest_items
+            if not is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_for_digest)
+        ]
         digest_items = digest_items[:DIGEST_SIZE]
 
         if digest_items:
@@ -1449,6 +1642,7 @@ def main():
                 # такую же новость от другого канала как "новую".
                 recent_words = load_recent_title_words()
                 new_title_words_list = []
+                new_recent_posts_entries = []
                 for it in finalized:
                     posted.add(it["id"])
                     posted.add(it["title_key"])
@@ -1456,8 +1650,13 @@ def main():
                     if it.get("content_words"):
                         recent_words.append(set(it["content_words"]))
                         new_title_words_list.append(it["content_words"])
+                    new_recent_posts_entries.append({
+                        "headline": it.get("title", ""),
+                        "summary": it.get("summary", ""),
+                    })
                 save_posted(posted)
                 save_recent_title_words(recent_words)
+                save_recent_posts(load_recent_posts() + new_recent_posts_entries)
 
                 digest_state["slots"] = digest_state.get("slots", []) + [slot]
                 new_digest_state = digest_state
@@ -1573,6 +1772,10 @@ def main():
                 recent_words.append(set(item["content_words"]))
                 save_recent_title_words(recent_words)
                 new_title_words_list.append(item["content_words"])
+            save_recent_posts(load_recent_posts() + [{
+                "headline": item.get("title", ""),
+                "summary": item.get("summary", ""),
+            }])
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
