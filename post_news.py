@@ -13,7 +13,7 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, quote
-from datetime import datetime
+from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -53,6 +53,24 @@ CTA_VARIANTS = [
 
 MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
 MILESTONES_FILE = "milestones.json"
+
+# --- Вовлечённость: дайджесты по расписанию, опрос, реакции ---
+# Цель: не только реагировать на новости, но и формировать привычку у
+# читателя ("зайти в 8 утра и в 21 вечера"), и дать аудитории способ
+# взаимодействовать с каналом, а не только читать.
+MSK_OFFSET = timedelta(hours=3)  # Москва не переходит на летнее/зимнее время с 2014 года
+DIGEST_TIMES = ["08:00", "21:00"]  # время публикации сводок по МСК
+DIGEST_SIZE = 5                     # сколько новостей включать в одну сводку
+DIGEST_WINDOW_MINUTES = 4           # окно срабатывания (cron раз в 2 минуты — берём с запасом)
+DIGEST_STATE_FILE = "last_digest.json"
+
+POLL_TIME = "12:00"  # МСК, время ежедневного вовлекающего опроса
+POLL_QUESTION = "Какая тема сейчас интереснее всего?"
+POLL_OPTIONS = ["Политика", "Происшествия", "Спорт", "Технологии", "Экономика"]
+POLL_STATE_FILE = "last_poll.json"
+
+CHANNEL_REACTIONS = ["👍", "🔥", "😱", "😢", "🤔"]
+REACTIONS_STATE_FILE = "reactions_enabled.json"
 
 URGENT_KEYWORDS = [
     "погиб", "убит", "жертв", "экстренн", "чрезвычайн", "эвакуац",
@@ -745,7 +763,99 @@ def maybe_celebrate_milestone(count):
         print(f"[INFO] Milestone celebrated: {new_milestone} subscribers.")
 
 
-STATE_FILES = [POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE]
+def now_msk():
+    return datetime.utcnow() + MSK_OFFSET
+
+
+def today_key(dt):
+    return dt.strftime("%Y-%m-%d")
+
+
+def due_digest_slot(dt, already_done_slots):
+    # Возвращает время слота (например "08:00"), если сейчас его окно и он
+    # ещё не публиковался сегодня; иначе None.
+    now_minutes = dt.hour * 60 + dt.minute
+    for slot in DIGEST_TIMES:
+        if slot in already_done_slots:
+            continue
+        slot_h, slot_m = map(int, slot.split(":"))
+        slot_minutes = slot_h * 60 + slot_m
+        if 0 <= (now_minutes - slot_minutes) <= DIGEST_WINDOW_MINUTES:
+            return slot
+    return None
+
+
+def due_poll(dt, already_sent_today):
+    if already_sent_today:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, POLL_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= DIGEST_WINDOW_MINUTES
+
+
+def send_poll_to_telegram(question, options):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPoll"
+    payload = {
+        "chat_id": CHAT_ID,
+        "question": question,
+        "options": options,
+        "is_anonymous": True,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[WARN] sendPoll failed: {data}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[WARN] sendPoll error: {e}")
+        return False
+
+
+def enable_reactions():
+    # Включает набор реакций под постами канала. Метод идемпотентный и
+    # дешёвый, но чтобы не дёргать API попусту каждые 2 минуты, статус
+    # сохраняется в REACTIONS_STATE_FILE и вызывается только пока не True.
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatAvailableReactions"
+    payload = {
+        "chat_id": CHAT_ID,
+        "available_reactions": [{"type": "emoji", "emoji": e} for e in CHANNEL_REACTIONS],
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[WARN] setChatAvailableReactions failed: {data}")
+            return False
+        print("[INFO] Reactions enabled.")
+        return True
+    except Exception as e:
+        print(f"[WARN] setChatAvailableReactions error: {e}")
+        return False
+
+
+def format_digest(items, slot_label):
+    lines = [f"{CHANNEL_MARK} <b>{slot_label}</b>", ""]
+    for i, it in enumerate(items, 1):
+        lines.append(f"{i}. <b>{it['headline']}</b>")
+        if it.get("body"):
+            first_sentence = it["body"].split(". ")[0].rstrip(".") + "."
+            lines.append(first_sentence)
+        lines.append("")
+    lines.append(random.choice(CTA_VARIANTS))
+    return "\n".join(lines).strip()
+
+
+STATE_FILES = [
+    POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
+    DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
+]
 
 
 def _git_show_json(ref_path, default):
@@ -759,7 +869,8 @@ def _git_show_json(ref_path, default):
         return default
 
 
-def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_publish=None):
+def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_publish=None,
+                          new_digest_state=None, new_poll_state=None, new_reactions_enabled=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
@@ -780,6 +891,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
             remote_recent = _git_show_json(f"origin/main:{RECENT_TITLES_FILE}", [])
             remote_last_run = _git_show_json(f"origin/main:{LAST_RUN_FILE}", {})
             remote_milestones = _git_show_json(f"origin/main:{MILESTONES_FILE}", {"last": 0})
+            remote_digest = _git_show_json(f"origin/main:{DIGEST_STATE_FILE}", {"date": None, "slots": []})
+            remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
+            remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -801,6 +915,12 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
             local_milestone = load_last_milestone()
             merged_milestones = {"last": max(remote_milestones.get("last", 0), local_milestone)}
 
+            merged_digest = new_digest_state if new_digest_state is not None else remote_digest
+            merged_poll = new_poll_state if new_poll_state is not None else remote_poll
+            merged_reactions = {
+                "enabled": bool(new_reactions_enabled) or bool(remote_reactions.get("enabled"))
+            }
+
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
             if reset.returncode != 0:
                 print(f"[WARN] git reset failed (attempt {attempt}): {reset.stderr}")
@@ -811,6 +931,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
             with open(LAST_RUN_FILE, "w") as f:
                 json.dump(merged_last_run, f)
             save_last_milestone(merged_milestones["last"])
+            _save_json(DIGEST_STATE_FILE, merged_digest)
+            _save_json(POLL_STATE_FILE, merged_poll)
+            _save_json(REACTIONS_STATE_FILE, merged_reactions)
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -836,20 +959,108 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
 def main():
     print(f"[START] {datetime.now().isoformat()}")
 
-    elapsed = seconds_since_last_publish()
+    dt_msk = now_msk()
+    day_key = today_key(dt_msk)
 
-    if elapsed is not None and elapsed < URGENT_INTERVAL:
-        print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
-              f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        return
+    # --- Реакции: включаем один раз, статус запоминаем, чтобы не дёргать API зря ---
+    reactions_state = _load_json(REACTIONS_STATE_FILE, {"enabled": False})
+    new_reactions_enabled = None
+    if not reactions_state.get("enabled"):
+        if enable_reactions():
+            new_reactions_enabled = True
+
+    # --- Ежедневный вовлекающий опрос ---
+    poll_state = _load_json(POLL_STATE_FILE, {"date": None, "sent": False})
+    if poll_state.get("date") != day_key:
+        poll_state = {"date": day_key, "sent": False}
+    new_poll_state = None
+    if due_poll(dt_msk, poll_state.get("sent")):
+        if send_poll_to_telegram(POLL_QUESTION, POLL_OPTIONS):
+            poll_state["sent"] = True
+            new_poll_state = poll_state
+            print("[INFO] Engagement poll sent.")
 
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
 
+    # --- Дайджест по расписанию (утро/вечер) ---
+    digest_state = _load_json(DIGEST_STATE_FILE, {"date": None, "slots": []})
+    if digest_state.get("date") != day_key:
+        digest_state = {"date": day_key, "slots": []}
+    new_digest_state = None
+
+    slot = due_digest_slot(dt_msk, digest_state.get("slots", []))
+    if slot:
+        digest_items = fetch_news()
+        digest_items.sort(key=lambda it: not it.get("urgent"))  # срочные — в начало
+        digest_items = digest_items[:DIGEST_SIZE]
+
+        if digest_items:
+            finalized = [finalize_item(it) for it in digest_items]
+            if slot == DIGEST_TIMES[0]:
+                slot_label = "Утренний дайджест"
+            elif len(DIGEST_TIMES) > 1 and slot == DIGEST_TIMES[1]:
+                slot_label = "Вечерний дайджест"
+            else:
+                slot_label = "Дайджест"
+
+            text = format_digest(finalized, slot_label)
+            if send_to_telegram(text):
+                posted = load_posted()
+                new_posted_ids = []
+                for it in finalized:
+                    posted.add(it["id"])
+                    posted.add(it["title_key"])
+                    new_posted_ids.extend([it["id"], it["title_key"]])
+                save_posted(posted)
+
+                digest_state["slots"] = digest_state.get("slots", []) + [slot]
+                new_digest_state = digest_state
+                mark_published_now()
+
+                persist_state_to_git(
+                    new_posted_ids=new_posted_ids,
+                    new_last_publish=time.time(),
+                    new_digest_state=new_digest_state,
+                    new_poll_state=new_poll_state,
+                    new_reactions_enabled=new_reactions_enabled,
+                )
+                print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
+                return
+            else:
+                print(f"[WARN] Digest send failed for slot {slot}, will retry next run.")
+        else:
+            # Кандидатов не нашлось — не публикуем пустую сводку, но слот
+            # всё равно помечаем пройденным, чтобы не пытаться на каждом
+            # cron-тике следующие несколько минут подряд.
+            digest_state["slots"] = digest_state.get("slots", []) + [slot]
+            new_digest_state = digest_state
+            print(f"[INFO] No candidates for digest slot {slot}, marking as done anyway.")
+
+    # --- Обычный поток: одна новость за запуск, как раньше ---
+    elapsed = seconds_since_last_publish()
+
+    if elapsed is not None and elapsed < URGENT_INTERVAL:
+        print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
+              f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
+        if new_digest_state or new_poll_state or new_reactions_enabled:
+            persist_state_to_git(
+                new_digest_state=new_digest_state,
+                new_poll_state=new_poll_state,
+                new_reactions_enabled=new_reactions_enabled,
+            )
+        return
+
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
+        if new_digest_state or new_poll_state or new_reactions_enabled:
+            persist_state_to_git(
+                new_digest_state=new_digest_state,
+                new_poll_state=new_poll_state,
+                new_reactions_enabled=new_reactions_enabled,
+            )
         return
 
     urgent_items = [it for it in news if it.get("urgent")]
@@ -865,6 +1076,12 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
+            if new_digest_state or new_poll_state or new_reactions_enabled:
+                persist_state_to_git(
+                    new_digest_state=new_digest_state,
+                    new_poll_state=new_poll_state,
+                    new_reactions_enabled=new_reactions_enabled,
+                )
             return
         normal_items = prefer_video(normal_items)
         featured_idx = pick_featured_index(normal_items)
@@ -906,6 +1123,9 @@ def main():
         new_posted_ids=new_posted_ids,
         new_title_words=new_title_words,
         new_last_publish=new_last_publish,
+        new_digest_state=new_digest_state,
+        new_poll_state=new_poll_state,
+        new_reactions_enabled=new_reactions_enabled,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
