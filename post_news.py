@@ -55,9 +55,6 @@ MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 
 MILESTONES_FILE = "milestones.json"
 
 # --- Вовлечённость: дайджесты по расписанию, опрос, реакции ---
-# Цель: не только реагировать на новости, но и формировать привычку у
-# читателя ("зайти в 8 утра и в 21 вечера"), и дать аудитории способ
-# взаимодействовать с каналом, а не только читать.
 MSK_OFFSET = timedelta(hours=3)  # Москва не переходит на летнее/зимнее время с 2014 года
 DIGEST_TIMES = ["08:00", "21:00"]  # время публикации сводок по МСК
 DIGEST_SIZE = 5                     # сколько новостей включать в одну сводку
@@ -126,8 +123,6 @@ MAX_SENTENCES = 7
 
 
 def limit_sentences(text, max_sentences=MAX_SENTENCES):
-    # Обрезает текст по границе предложения, а не посимвольно —
-    # чтобы пост не заканчивался на середине слова/мысли.
     if not text:
         return text
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
@@ -151,7 +146,6 @@ SOURCE_MENTION_PATTERNS = [
 
 
 def strip_source_mentions(text):
-    # Убирает из текста ссылки и явные упоминания источника
     if not text:
         return text
     for pattern in SOURCE_MENTION_PATTERNS:
@@ -183,7 +177,6 @@ _gigachat_token = None
 _gigachat_token_expires_at = 0
 
 def get_gigachat_token():
-    # Получает (и кэширует) access_token GigaChat. Токен живёт ~30 минут.
     global _gigachat_token, _gigachat_token_expires_at
     if not GIGACHAT_AUTH_KEY:
         return None
@@ -240,8 +233,6 @@ def save_posted(posted_set):
 
 
 def title_dedup_key(title):
-    # Ключ для отсева ТОЧНЫХ дублей: приводим к нижнему регистру,
-    # убираем пунктуацию и берём хэш.
     t = title.lower()
     t = re.sub(r'[^a-zа-яё0-9\s]', '', t, flags=re.IGNORECASE)
     t = re.sub(r'\s+', ' ', t).strip()
@@ -263,18 +254,27 @@ def significant_title_words(title):
     return words
 
 
-def titles_are_similar(words_a, words_b, threshold=0.6):
-    # Раньше здесь считался коэффициент Жаккара (общие / ВСЕ слова обоих
-    # заголовков) — он занижает похожесть для коротких заголовков, когда у
-    # одного источника на 1-2 слова больше ("из-за непогоды" против "из-за
-    # мощного шторма"), даже если речь об одном и том же событии. Реальный
-    # случай: "Один человек погиб, еще 13 пострадали из-за мощного шторма"
-    # (readovkanews) и "Один человек погиб, 13 пострадали из-за непогоды"
-    # (rian_ru) — Жаккар давал ~0.5 и не всегда ловил дубль, из-за чего
-    # одна и та же новость от двух каналов публиковалась дважды.
-    # Теперь считаем коэффициент перекрытия: общие слова / слова в БОЛЕЕ
-    # КОРОТКОМ заголовке — если короткий заголовок почти целиком содержится
-    # в длинном, это тот же самый факт, рассказанный чуть подробнее.
+def significant_words(text):
+    # То же самое, но для произвольного текста (используется для summary)
+    return significant_title_words(text or "")
+
+
+def content_words(title, summary):
+    # ВАЖНО (фикс): раньше дедуп сравнивал только заголовки. Разные каналы
+    # часто формулируют заголовок про одно и то же событие совершенно
+    # по-разному ("вернулся для восстановления" / "вернулся после ЧМ"),
+    # из-за чего похожая новость проходила как "новая". Слова из summary
+    # (имена, цифры, места) обычно совпадают гораздо надёжнее, чем слова
+    # в заголовке — добавляем их в сравнение.
+    return significant_title_words(title) | significant_words(summary)
+
+
+def titles_are_similar(words_a, words_b, threshold=0.5):
+    # Коэффициент перекрытия: общие слова / слова в БОЛЕЕ КОРОТКОМ наборе —
+    # если меньший набор почти целиком содержится в большем, речь об одном
+    # и том же факте. Порог снижен с 0.6 до 0.5 после перехода на
+    # title+summary (наборы слов стали крупнее, и полезный сигнал
+    # разбавляется словами, не относящимися к сути события).
     if not words_a or not words_b:
         return False
     smaller = min(len(words_a), len(words_b))
@@ -288,9 +288,6 @@ RECENT_TITLES_LIMIT = 300
 
 
 def load_recent_title_words():
-    # Защита от повреждённого/устаревшего формата recent_titles.json (например,
-    # оставшегося от более ранней версии бота) — пропускаем записи, которые
-    # нельзя превратить в множество строк, вместо падения всего скрипта.
     raw = _load_json(RECENT_TITLES_FILE, [])
     result = []
     for words in raw:
@@ -399,7 +396,6 @@ TELEGRAM_PREVIEW_HEADERS = {
 
 
 def fetch_telegram_channel(username, limit=20):
-    # Читает последние посты публичного Telegram-канала через t.me/s/<username>
     url = f"https://t.me/s/{username}"
     try:
         resp = requests.get(url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=FETCH_TIMEOUT)
@@ -469,10 +465,10 @@ def fetch_telegram_channel(username, limit=20):
 
 def fetch_news():
     posted = load_posted()
-    recent_title_words = load_recent_title_words()
+    recent_content_words = load_recent_title_words()
     new_items = []
     seen_title_keys = set()
-    seen_title_words = []
+    seen_content_words = []
 
     if not os.path.exists(FEEDS_FILE):
         print("[ERROR] feeds.txt not found!")
@@ -504,14 +500,18 @@ def fetch_news():
             if title_key in posted or title_key in seen_title_keys:
                 continue
 
-            title_words = significant_title_words(title)
-            if is_duplicate_by_meaning(title_words, recent_title_words) or \
-               any(titles_are_similar(title_words, w) for w in seen_title_words):
-                continue
-
             raw_summary = entry.get("summary", entry.get("description", ""))
             summary = strip_source_mentions(html.unescape(re.sub(r"<[^>]+>", "", raw_summary)))
             link = entry.get("link", "")
+
+            # ФИКС: сравниваем по словам заголовка + summary вместе (не
+            # только заголовка), потому что разные каналы часто по-разному
+            # формулируют заголовок про одно и то же событие, а факты в
+            # тексте (summary) обычно совпадают.
+            c_words = content_words(title, summary)
+            if is_duplicate_by_meaning(c_words, recent_content_words) or \
+               any(titles_are_similar(c_words, w) for w in seen_content_words):
+                continue
 
             if is_not_news(title, summary):
                 continue
@@ -529,7 +529,7 @@ def fetch_news():
             new_items.append({
                 "id": entry_id,
                 "title_key": title_key,
-                "title_words": list(title_words),
+                "content_words": list(c_words),
                 "source": src,
                 "urgent": urgent,
                 "title": title,
@@ -541,7 +541,7 @@ def fetch_news():
                 "published": entry.get("published", datetime.now().isoformat())
             })
             seen_title_keys.add(title_key)
-            seen_title_words.append(title_words)
+            seen_content_words.append(c_words)
 
     return new_items
 
@@ -596,6 +596,24 @@ def pick_featured_index(items):
     except Exception as e:
         print(f"[WARN] pick_featured_index error: {e}")
     return 0
+
+
+def pick_non_duplicate(items):
+    # ФИКС (защита от гонки между запусками): к моменту, когда мы
+    # действительно готовы отправлять пост, могло пройти время — например,
+    # только что отработал дайджест и опубликовал что-то очень похожее на
+    # нашего кандидата. Перечитываем posted/recent прямо перед отправкой и
+    # берём первого кандидата, который всё ещё не дубликат.
+    posted_now = load_posted()
+    recent_now = load_recent_title_words()
+    for it in items:
+        if it["id"] in posted_now or it["title_key"] in posted_now:
+            continue
+        cw = set(it.get("content_words") or [])
+        if cw and is_duplicate_by_meaning(cw, recent_now):
+            continue
+        return it
+    return None
 
 
 def send_to_telegram(text):
@@ -772,8 +790,6 @@ def today_key(dt):
 
 
 def due_digest_slot(dt, already_done_slots):
-    # Возвращает время слота (например "08:00"), если сейчас его окно и он
-    # ещё не публиковался сегодня; иначе None.
     now_minutes = dt.hour * 60 + dt.minute
     for slot in DIGEST_TIMES:
         if slot in already_done_slots:
@@ -817,9 +833,6 @@ def send_poll_to_telegram(question, options):
 
 
 def enable_reactions():
-    # Включает набор реакций под постами канала. Метод идемпотентный и
-    # дешёвый, но чтобы не дёргать API попусту каждые 2 минуты, статус
-    # сохраняется в REACTIONS_STATE_FILE и вызывается только пока не True.
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatAvailableReactions"
@@ -869,14 +882,18 @@ def _git_show_json(ref_path, default):
         return default
 
 
-def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_publish=None,
+def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None, new_reactions_enabled=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
 
     new_posted_ids = new_posted_ids or []
-    new_title_words = new_title_words or []
+    # ФИКС: раньше сюда передавался только ОДИН набор слов (от одиночного
+    # поста), а дайджест вообще ничего не передавал. Теперь это список
+    # наборов слов — по одному на каждый реально отправленный пост, включая
+    # все элементы дайджеста.
+    new_title_words_list = new_title_words_list or []
 
     try:
         subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
@@ -904,8 +921,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words=None, new_last_pub
                     merged_recent.append(set(x for x in w if isinstance(x, str)))
                 except TypeError:
                     continue
-            if new_title_words:
-                merged_recent.append(set(new_title_words))
+            for words in new_title_words_list:
+                if words:
+                    merged_recent.append(set(words))
             merged_recent = merged_recent[-RECENT_TITLES_LIMIT:]
 
             merged_last_run = remote_last_run
@@ -1009,11 +1027,21 @@ def main():
             if send_to_telegram(text):
                 posted = load_posted()
                 new_posted_ids = []
+                # ФИКС: раньше слова заголовков элементов дайджеста нигде не
+                # сохранялись — из-за этого meaning-дедуп "не знал" про
+                # новости, ушедшие в дайджест, и потом мог пропустить точно
+                # такую же новость от другого канала как "новую".
+                recent_words = load_recent_title_words()
+                new_title_words_list = []
                 for it in finalized:
                     posted.add(it["id"])
                     posted.add(it["title_key"])
                     new_posted_ids.extend([it["id"], it["title_key"]])
+                    if it.get("content_words"):
+                        recent_words.append(set(it["content_words"]))
+                        new_title_words_list.append(it["content_words"])
                 save_posted(posted)
+                save_recent_title_words(recent_words)
 
                 digest_state["slots"] = digest_state.get("slots", []) + [slot]
                 new_digest_state = digest_state
@@ -1021,6 +1049,7 @@ def main():
 
                 persist_state_to_git(
                     new_posted_ids=new_posted_ids,
+                    new_title_words_list=new_title_words_list,
                     new_last_publish=time.time(),
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
@@ -1031,9 +1060,6 @@ def main():
             else:
                 print(f"[WARN] Digest send failed for slot {slot}, will retry next run.")
         else:
-            # Кандидатов не нашлось — не публикуем пустую сводку, но слот
-            # всё равно помечаем пройденным, чтобы не пытаться на каждом
-            # cron-тике следующие несколько минут подряд.
             digest_state["slots"] = digest_state.get("slots", []) + [slot]
             new_digest_state = digest_state
             print(f"[INFO] No candidates for digest slot {slot}, marking as done anyway.")
@@ -1071,7 +1097,7 @@ def main():
         return with_video if with_video else items
 
     if urgent_items:
-        chosen = prefer_video(urgent_items)[0]
+        ordered = prefer_video(urgent_items)
     else:
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
@@ -1085,7 +1111,23 @@ def main():
             return
         normal_items = prefer_video(normal_items)
         featured_idx = pick_featured_index(normal_items)
-        chosen = normal_items[featured_idx]
+        # AI-выбранный кандидат идёт первым, остальные — запасные варианты
+        ordered = [normal_items[featured_idx]] + [it for i, it in enumerate(normal_items) if i != featured_idx]
+
+    # ФИКС: финальная проверка на дубликат прямо перед отправкой (см.
+    # pick_non_duplicate) — на случай, если что-то очень похожее было
+    # опубликовано (например, дайджестом) уже после того, как мы собрали
+    # список кандидатов.
+    chosen = pick_non_duplicate(ordered)
+    if chosen is None:
+        print("[INFO] All candidates turned out to be duplicates of already-posted news.")
+        if new_digest_state or new_poll_state or new_reactions_enabled:
+            persist_state_to_git(
+                new_digest_state=new_digest_state,
+                new_poll_state=new_poll_state,
+                new_reactions_enabled=new_reactions_enabled,
+            )
+        return
 
     chosen = finalize_item(chosen)
     news = [chosen][:ITEMS_PER_RUN]
@@ -1093,7 +1135,7 @@ def main():
     posted = load_posted()
     sent_count = 0
     new_posted_ids = []
-    new_title_words = None
+    new_title_words_list = []
     new_last_publish = None
     for i, item in enumerate(news):
         text = format_post(item)
@@ -1104,11 +1146,11 @@ def main():
             posted.add(item["title_key"])
             save_posted(posted)
             new_posted_ids.extend([item["id"], item["title_key"]])
-            if item.get("title_words"):
+            if item.get("content_words"):
                 recent_words = load_recent_title_words()
-                recent_words.append(set(item["title_words"]))
+                recent_words.append(set(item["content_words"]))
                 save_recent_title_words(recent_words)
-                new_title_words = item["title_words"]
+                new_title_words_list.append(item["content_words"])
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
@@ -1121,7 +1163,7 @@ def main():
 
     persist_state_to_git(
         new_posted_ids=new_posted_ids,
-        new_title_words=new_title_words,
+        new_title_words_list=new_title_words_list,
         new_last_publish=new_last_publish,
         new_digest_state=new_digest_state,
         new_poll_state=new_poll_state,
