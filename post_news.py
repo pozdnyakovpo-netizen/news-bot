@@ -610,6 +610,34 @@ def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts
     return False
 
 
+STORY_CONTINUATION_WINDOW_HOURS = 48
+
+
+def find_story_continuation(candidate_title, candidate_summary, recent_posts,
+                             hours=STORY_CONTINUATION_WINDOW_HOURS):
+    # "Продолжение истории": кандидат уже ПРОШЁЛ проверку на дубликат (иначе
+    # его бы не публиковали вовсе) — эта функция не про дедуп, а про то,
+    # чтобы связать НОВУЮ, но связанную новость с предыдущим постом на ту же
+    # тему/место/персону (общий именной стем), опубликованным недавно.
+    # Ищем самое СВЕЖЕЕ совпадение — если их несколько, ссылаемся на
+    # последний пост по теме, а не на самый первый.
+    c_entities = extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)
+    if not c_entities:
+        return None
+    now = time.time()
+    best = None
+    for post in recent_posts:
+        if not post.get("message_id"):
+            continue
+        ts = post.get("ts")
+        if ts and now - ts > hours * 3600:
+            continue
+        p_entities = extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))
+        if c_entities & p_entities:
+            best = post  # recent_posts в порядке добавления — последнее совпадение самое свежее
+    return best
+
+
 MAX_AI_DEDUPE_CHECKS = 5  # ограничиваем число вызовов ИИ на дедуп за один запуск
 
 
@@ -1134,9 +1162,14 @@ def pick_non_duplicate(items):
 
 
 def send_to_telegram(text):
+    # ФИКС/расширение: возвращает message_id (число) при успехе вместо
+    # True, или None при неудаче — вызовы вида "if send_to_telegram(...)"
+    # продолжают работать как раньше (число истинно, None ложно), но
+    # теперь можно сохранить message_id для построения ссылки на пост
+    # (нужно для "🔄 Продолжение истории").
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("[ERROR] Telegram credentials missing.")
-        return False
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -1147,28 +1180,37 @@ def send_to_telegram(text):
     try:
         resp = request_with_retry("POST", url, json=payload, timeout=10)
         if resp.status_code == 200:
-            return True
+            try:
+                return resp.json().get("result", {}).get("message_id")
+            except Exception:
+                return True  # отправилось, но не смогли распарсить id — не считаем ошибкой
         else:
             print(f"[ERROR] Telegram send failed: {resp.text}")
-            return False
+            return None
     except Exception as e:
         print(f"[ERROR] Telegram request error: {e}")
-        return False
+        return None
 
 
 def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/send{method}"
     cap = {"caption": caption[:1024], "parse_mode": "HTML"} if caption is not None else {}
     filename = "photo.jpg" if field == "photo" else "video.mp4"
+
+    def _extract_id(resp):
+        try:
+            return resp.json().get("result", {}).get("message_id")
+        except Exception:
+            return True
 
     if media_bytes:
         try:
             resp = request_with_retry("POST", url, data={"chat_id": CHAT_ID, **cap},
                                        files={field: (filename, media_bytes)}, timeout=30)
             if resp.status_code == 200:
-                return True
+                return _extract_id(resp)
             print(f"[WARN] send{method} by cached bytes failed: {resp.text}")
         except Exception as e:
             print(f"[WARN] send{method} by cached bytes error: {e}")
@@ -1176,7 +1218,7 @@ def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=
     try:
         resp = request_with_retry("POST", url, json={"chat_id": CHAT_ID, field: media_url, **cap}, timeout=15)
         if resp.status_code == 200:
-            return True
+            return _extract_id(resp)
         print(f"[WARN] send{method} by URL failed: {resp.text}")
     except Exception as e:
         print(f"[WARN] send{method} by URL error: {e}")
@@ -1187,12 +1229,12 @@ def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=
         resp = request_with_retry("POST", url, data={"chat_id": CHAT_ID, **cap},
                                    files={field: (filename, dl.content)}, timeout=30)
         if resp.status_code == 200:
-            return True
+            return _extract_id(resp)
         print(f"[WARN] send{method} by upload failed: {resp.text}")
-        return False
+        return None
     except Exception as e:
         print(f"[WARN] send{method} by upload error: {e}")
-        return False
+        return None
 
 
 def send_photo_to_telegram(photo_url, caption=None, photo_bytes=None):
@@ -1215,8 +1257,9 @@ def send_post(item, text):
 
     if media_url:
         if len(text) <= 1024:
-            if sender(media_url, text):
-                return True
+            msg_id = sender(media_url, text)
+            if msg_id:
+                return msg_id
             return send_to_telegram(text)
         else:
             media_ok = sender(media_url)
@@ -1237,6 +1280,17 @@ def format_post(item, extra=""):
     else:
         mark = category_emoji
     text = f"{mark} <b>{item['headline']}</b>"
+
+    # "🔄 Продолжение истории" — если новость связана с недавним постом на
+    # ту же тему (общее место/персона), но не является его дубликатом
+    # (иначе была бы отфильтрована раньше) — даём читателю ссылку на
+    # предыдущий пост, чтобы он видел развитие сюжета, а не разрозненные
+    # посты об одном и том же.
+    continuation = item.get("continuation_of")
+    if continuation and continuation.get("message_id"):
+        link = f"https://t.me/{CHANNEL_USERNAME}/{continuation['message_id']}"
+        text += f"\n🔄 <a href=\"{link}\">Продолжение истории</a>"
+
     if item.get("body"):
         text += f"\n\n{item['body']}"
 
@@ -1801,7 +1855,8 @@ def main():
                 slot_label = "Дайджест"
 
             text = format_digest(finalized, slot_label)
-            if send_to_telegram(text):
+            digest_msg_id = send_to_telegram(text)
+            if digest_msg_id:
                 posted = load_posted()
                 new_posted_ids = []
                 # ФИКС: раньше слова заголовков элементов дайджеста нигде не
@@ -1822,6 +1877,7 @@ def main():
                         "headline": it.get("title", ""),
                         "summary": it.get("summary", ""),
                         "ts": time.time(),
+                        "message_id": digest_msg_id if isinstance(digest_msg_id, int) else None,
                     })
                 save_posted(posted)
                 save_recent_title_words(recent_words)
@@ -1924,6 +1980,14 @@ def main():
             )
         return
 
+    # "Продолжение истории": кандидат уже прошёл все проверки на дубликат
+    # выше — если он всё же связан с недавним постом (общее место/персона),
+    # добавим ссылку на предыдущий пост вместо того, чтобы публиковать
+    # несвязанные друг с другом посты об одном и том же сюжете.
+    chosen["continuation_of"] = find_story_continuation(
+        chosen["title"], chosen.get("summary", ""), load_recent_posts()
+    )
+
     chosen = finalize_item(chosen)
     news = [chosen][:ITEMS_PER_RUN]
 
@@ -1950,6 +2014,7 @@ def main():
                 "headline": item.get("title", ""),
                 "summary": item.get("summary", ""),
                 "ts": time.time(),
+                "message_id": ok if isinstance(ok, int) else None,
             }])
             sent_count += 1
             time.sleep(SEND_DELAY)
