@@ -1229,8 +1229,10 @@ def update_channel_description(count):
     if count is None or not TELEGRAM_TOKEN or not CHAT_ID:
         return
     description = (
-        f"Коротко о главном. Один пост — одна новость, без вороха дублей и рекламы. "
-        f"Источники — проверенные федеральные СМИ и Telegram-каналы.\n"
+        f"⚡️ Самое важное за день — коротко, без воды и рекламы. Один пост — "
+        f"одна новость.\n"
+        f"Источники: РИА, РБК, ТАСС, Readovka, Mash, Baza и ещё 15 проверенных СМИ.\n"
+        f"🕗 Дайджесты в 08:00 и 21:00 мск.\n"
         f"{count} подписчиков"
     )[:255]
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatDescription"
