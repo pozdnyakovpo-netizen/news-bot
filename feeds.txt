@@ -1,9 +1,34 @@
-mash
-bazabazon
-readovkanews
-ostorozhno_novosti
+# Список источников для бота — сверено с реальными @username каналов в Telegram
+# Формат: одно имя канала на строку (без @), строки с # игнорируются
+
+# --- Крупные федеральные агентства ---
 rian_ru
 rbc_news
-tass_agency
+gazetaru
+rgrunews
 rt_russian
-match_tv
+
+# --- Оперативные/эксклюзивные новостные каналы ---
+readovkanews
+breakingmash
+bazabazon
+shot_shot
+bbbreaking
+ostorozhno_novosti
+srochnow
+tele_eve
+lentadnya
+
+# --- Военные/спецоперация ---
+milinfolive
+kontext_channel
+
+# --- Происшествия ---
+ENews112
+
+# --- Москва ---
+moscowmap
+moscowach
+
+# --- Независимое издание (см. примечание в чате про статус иноагента) ---
+astrapress
