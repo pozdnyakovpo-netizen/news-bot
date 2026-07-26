@@ -1,11 +1,6 @@
 name: News Bot
 on:
   schedule:
-    # ФИКС: было */2 (раз в 2 минуты). GitHub Actions официально не
-    # гарантирует точность расписаний чаще 5 минут — при нагрузке события
-    # задерживаются и могут накапливаться в очереди, что повышает шанс
-    # конфликтов при git push и, как следствие, риск дублей (см. переписку
-    # про дубль поста с СУ-34). */5 — более безопасный интервал.
     - cron: "*/5 * * * *"
   workflow_dispatch:
 permissions:
@@ -29,6 +24,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
           PYTHONUNBUFFERED: "1"
         run: python post_news.py
