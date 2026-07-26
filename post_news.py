@@ -259,7 +259,19 @@ RECENT_TITLES_LIMIT = 300
 
 
 def load_recent_title_words():
-    return [set(words) for words in _load_json(RECENT_TITLES_FILE, [])]
+    # Защита от повреждённого/устаревшего формата recent_titles.json (например,
+    # оставшегося от более ранней версии бота) — пропускаем записи, которые
+    # нельзя превратить в множество строк, вместо падения всего скрипта.
+    raw = _load_json(RECENT_TITLES_FILE, [])
+    result = []
+    for words in raw:
+        if not isinstance(words, list):
+            continue
+        try:
+            result.append(set(w for w in words if isinstance(w, str)))
+        except TypeError:
+            continue
+    return result
 
 
 def save_recent_title_words(list_of_word_sets):
