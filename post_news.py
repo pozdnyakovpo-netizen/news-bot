@@ -17,9 +17,54 @@ from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+def request_with_retry(method, url, max_attempts=4, **kwargs):
+    # Признаки 1/2: единая точка retry для ЛЮБОГО HTTP-вызова в боте.
+    # Раньше сетевые обрывы (timeout, connection reset) не перехватывались
+    # почти нигде, кроме ручной проверки статус-кода 401/429 у GigaChat —
+    # обрыв соединения приводил к падению функции с первого раза.
+    # Дополнительно уважаем Retry-After, который Telegram присылает при 429.
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt == max_attempts:
+                break
+            backoff = min(1.5 * (2 ** (attempt - 1)), 15) + random.uniform(0, 0.5)
+            print(f"[WARN] network error on {url} (attempt {attempt}/{max_attempts}): {e} — retry in {backoff:.1f}s")
+            time.sleep(backoff)
+            continue
+
+        if resp.status_code == 429:
+            retry_after = None
+            try:
+                retry_after = resp.json().get("parameters", {}).get("retry_after")
+            except Exception:
+                pass
+            if retry_after is None:
+                retry_after = int(resp.headers.get("Retry-After", 3))
+            if attempt == max_attempts:
+                return resp
+            print(f"[WARN] 429 from {url}, waiting {retry_after}s as instructed (attempt {attempt}/{max_attempts})")
+            time.sleep(retry_after + 0.5)
+            continue
+
+        return resp
+
+    raise last_exc if last_exc else RuntimeError(f"request_with_retry exhausted attempts for {url}")
+
 # --- Настройки ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Признак 3 (уведомление админу): отдельный чат/личка для служебных
+# алертов, чтобы не засорять сам новостной канал системными сообщениями.
+# Необязательный — если не задан, алерты просто логируются.
+ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+SILENCE_ALERT_HOURS = 3  # если публикаций не было дольше этого — сигнал админу
+ALERT_STATE_FILE = "last_alert.json"
+STATUS_FILE = "status.json"  # признак 4: снимок состояния бота для внешнего мониторинга
 GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")  # "Ключ авторизации" из личного кабинета Sber
 GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -308,7 +353,7 @@ def get_gigachat_token():
     }
     data = {"scope": GIGACHAT_SCOPE}
     try:
-        resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=(5, 15))
+        resp = request_with_retry("POST", GIGACHAT_OAUTH_URL, headers=headers, data=data, verify=False, timeout=(5, 15))
         resp.raise_for_status()
         payload = resp.json()
         _gigachat_token = payload["access_token"]
@@ -461,7 +506,10 @@ def rewrite_with_ai(title, summary):
             "'сенсация', а также вводные канцеляризмы в начале текста вроде 'как сообщается', "
             "'как стало известно', 'по имеющимся данным' — начинай сразу с сути. "
             "Не добавляй свои эмодзи ни в заголовок, ни в текст — они не нужны, "
-            "оформление уже добавляет их отдельно. Не пиши заголовок КАПСОМ.",
+            "оформление уже добавляет их отдельно. Не пиши заголовок КАПСОМ. "
+            "Сохраняй нейтральный тон агентства: не используй оценочные слова "
+            "('ужасный', 'прекрасный', 'отвратительно', 'блестящий', 'катастрофический') "
+            "и не выражай своё отношение к событию — только факты.",
             "",
             f"Заголовок исходной новости: {title}",
             f"Краткое содержание: {summary if summary else 'нет'}",
@@ -483,7 +531,7 @@ def rewrite_with_ai(title, summary):
             "temperature": 0.7,
             "max_tokens": 800,
         }
-        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
         if resp.status_code == 401:
             global _gigachat_token
             _gigachat_token = None
@@ -491,7 +539,7 @@ def rewrite_with_ai(title, summary):
             if not token:
                 return None
             headers["Authorization"] = f"Bearer {token}"
-            resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
+            resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
 
         if resp.status_code == 429:
             print("[WARN] GigaChat rate limit (429) — backing off.")
@@ -698,6 +746,36 @@ def fetch_news():
     return new_items
 
 
+def split_long_sentences(text, max_words=25):
+    # Признак: слишком длинное предложение (>25 слов) читается тяжело —
+    # разбиваем по ближайшей запятой к середине, если такая есть, иначе
+    # оставляем как есть (лучше длинное предложение, чем испорченный смысл).
+    if not text:
+        return text
+    sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    result = []
+    for s in sentences:
+        words = s.split()
+        if len(words) <= max_words:
+            result.append(s)
+            continue
+        comma_positions = [i for i, w in enumerate(words) if w.endswith(",")]
+        if not comma_positions:
+            result.append(s)
+            continue
+        mid = len(words) // 2
+        split_at = min(comma_positions, key=lambda i: abs(i - mid))
+        first = " ".join(words[:split_at + 1]).rstrip(",") + "."
+        second = " ".join(words[split_at + 1:])
+        if second:
+            second = second[0].upper() + second[1:]
+            result.append(first)
+            result.append(second)
+        else:
+            result.append(s)
+    return " ".join(result)
+
+
 def paragraphize(text, sentences_per_para=2):
     # Признак топ-каналов: короткие абзацы (1-2 предложения), а не
     # сплошной блок текста — читается заметно быстрее с телефона.
@@ -726,10 +804,18 @@ def finalize_item(item):
     # Признаки 3/4/5/7: убираем decorative-эмодзи от AI, клише-вставки,
     # КАПС и повторяющуюся пунктуацию — до экранирования HTML и до обрезки.
     headline_raw = fix_shouty_caps(strip_cliche_openers(sanitize_text(headline_raw)))
-    body_raw = strip_cliche_openers(sanitize_text(body_raw))
+    body_raw = split_long_sentences(strip_cliche_openers(sanitize_text(body_raw)))
 
     item["headline"] = html.escape(truncate_at_word(headline_raw)) if headline_raw else html.escape(truncate_at_word(item["title"]))
-    item["body"] = html.escape(paragraphize(body_raw)) if body_raw else ""
+
+    if item.get("urgent"):
+        # Признак «молния»: срочная новость — коротко и без разбивки на
+        # абзацы (1-2 предложения), как экстренный формат у РИА/ТАСС —
+        # читатель должен понять суть за секунду, без прокрутки.
+        urgent_body = limit_sentences(body_raw, max_sentences=2)
+        item["body"] = html.escape(urgent_body) if urgent_body else ""
+    else:
+        item["body"] = html.escape(paragraphize(body_raw)) if body_raw else ""
 
     item["category"] = detect_category(item["title"], item.get("summary", ""))
 
@@ -764,7 +850,7 @@ def pick_featured_index(items):
             "temperature": 0.3,
             "max_tokens": 10,
         }
-        resp = requests.post(GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 15))
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 15))
         resp.raise_for_status()
         answer = resp.json()["choices"][0]["message"]["content"].strip()
         match = re.search(r"\d+", answer)
@@ -807,7 +893,7 @@ def send_to_telegram(text):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = request_with_retry("POST", url, json=payload, timeout=10)
         if resp.status_code == 200:
             return True
         else:
@@ -827,8 +913,8 @@ def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=
 
     if media_bytes:
         try:
-            resp = requests.post(url, data={"chat_id": CHAT_ID, **cap},
-                                  files={field: (filename, media_bytes)}, timeout=30)
+            resp = request_with_retry("POST", url, data={"chat_id": CHAT_ID, **cap},
+                                       files={field: (filename, media_bytes)}, timeout=30)
             if resp.status_code == 200:
                 return True
             print(f"[WARN] send{method} by cached bytes failed: {resp.text}")
@@ -836,7 +922,7 @@ def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=
             print(f"[WARN] send{method} by cached bytes error: {e}")
 
     try:
-        resp = requests.post(url, json={"chat_id": CHAT_ID, field: media_url, **cap}, timeout=15)
+        resp = request_with_retry("POST", url, json={"chat_id": CHAT_ID, field: media_url, **cap}, timeout=15)
         if resp.status_code == 200:
             return True
         print(f"[WARN] send{method} by URL failed: {resp.text}")
@@ -846,8 +932,8 @@ def _send_media_to_telegram(method, field, media_url, caption=None, media_bytes=
     try:
         dl = requests.get(media_url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=20)
         dl.raise_for_status()
-        resp = requests.post(url, data={"chat_id": CHAT_ID, **cap},
-                              files={field: (filename, dl.content)}, timeout=30)
+        resp = request_with_retry("POST", url, data={"chat_id": CHAT_ID, **cap},
+                                   files={field: (filename, dl.content)}, timeout=30)
         if resp.status_code == 200:
             return True
         print(f"[WARN] send{method} by upload failed: {resp.text}")
@@ -949,7 +1035,7 @@ def update_channel_description(count):
     )[:255]
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatDescription"
     try:
-        resp = requests.post(url, json={"chat_id": CHAT_ID, "description": description}, timeout=10)
+        resp = request_with_retry("POST", url, json={"chat_id": CHAT_ID, "description": description}, timeout=10)
         data = resp.json()
         if not data.get("ok"):
             print(f"[WARN] setChatDescription failed: {data}")
@@ -988,6 +1074,56 @@ def now_msk():
     return datetime.utcnow() + MSK_OFFSET
 
 
+def send_admin_alert(text):
+    # Признак 3: короткое уведомление в личный/служебный чат админа —
+    # НЕ в новостной канал, чтобы не засорять его системными сообщениями.
+    # Если ADMIN_CHAT_ID не задан, просто логируем — работа бота не рвётся.
+    if not TELEGRAM_TOKEN:
+        return False
+    if not ADMIN_CHAT_ID:
+        print(f"[INFO] (admin alert, no ADMIN_CHAT_ID set): {text}")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        resp = request_with_retry("POST", url, json={"chat_id": ADMIN_CHAT_ID, "text": text}, timeout=10)
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[WARN] send_admin_alert error: {e}")
+        return False
+
+
+def check_silence_alert(elapsed):
+    # Признак 3: если публикаций не было дольше SILENCE_ALERT_HOURS —
+    # шлём алерт админу, но не чаще раза в сутки. ВАЖНО: не пишем
+    # ALERT_STATE_FILE здесь напрямую — persist_state_to_git делает
+    # git reset --hard перед коммитом и стёр бы эту запись. Вместо этого
+    # возвращаем новую метку времени, чтобы main() передал её в persist.
+    if elapsed is None or elapsed < SILENCE_ALERT_HOURS * 3600:
+        return None
+    alert_state = _load_json(ALERT_STATE_FILE, {"last_alert": 0})
+    if time.time() - alert_state.get("last_alert", 0) < 24 * 3600:
+        return None
+    hours = elapsed / 3600
+    if send_admin_alert(
+        f"⚠️ Бот молчит уже {hours:.1f} ч. Проверьте фиды, GigaChat-квоту "
+        f"и логи workflow — возможно, источники недоступны или упал токен."
+    ):
+        return time.time()
+    return None
+
+
+def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
+    # Признак 4: снимок состояния для внешнего мониторинга (например,
+    # UptimeRobot может проверять поле "healthy" в сыром файле status.json).
+    return {
+        "last_check": datetime.utcnow().isoformat(),
+        "seconds_since_last_publish": last_publish_elapsed,
+        "healthy": last_publish_elapsed is None or last_publish_elapsed < SILENCE_ALERT_HOURS * 3600,
+        "sent_count_last_run": sent_count,
+        "note": note,
+    }
+
+
 def today_key(dt):
     return dt.strftime("%Y-%m-%d")
 
@@ -1024,7 +1160,7 @@ def send_poll_to_telegram(question, options):
         "is_anonymous": True,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = request_with_retry("POST", url, json=payload, timeout=10)
         data = resp.json()
         if not data.get("ok"):
             print(f"[WARN] sendPoll failed: {data}")
@@ -1044,7 +1180,7 @@ def enable_reactions():
         "available_reactions": [{"type": "emoji", "emoji": e} for e in CHANNEL_REACTIONS],
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = request_with_retry("POST", url, json=payload, timeout=10)
         data = resp.json()
         if not data.get("ok"):
             print(f"[WARN] setChatAvailableReactions failed: {data}")
@@ -1074,6 +1210,7 @@ def format_digest(items, slot_label):
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
+    ALERT_STATE_FILE, STATUS_FILE,
 ]
 
 
@@ -1089,7 +1226,8 @@ def _git_show_json(ref_path, default):
 
 
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
-                          new_digest_state=None, new_poll_state=None, new_reactions_enabled=None):
+                          new_digest_state=None, new_poll_state=None, new_reactions_enabled=None,
+                          new_alert_timestamp=None, new_status=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
@@ -1126,6 +1264,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_digest = _git_show_json(f"origin/main:{DIGEST_STATE_FILE}", {"date": None, "slots": []})
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
             remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
+            remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -1153,6 +1292,10 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_reactions = {
                 "enabled": bool(new_reactions_enabled) or bool(remote_reactions.get("enabled"))
             }
+            merged_alert = {
+                "last_alert": max(remote_alert.get("last_alert", 0), new_alert_timestamp or 0)
+            }
+            merged_status = new_status if new_status is not None else _git_show_json(f"origin/main:{STATUS_FILE}", {})
 
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
             if reset.returncode != 0:
@@ -1167,6 +1310,8 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(DIGEST_STATE_FILE, merged_digest)
             _save_json(POLL_STATE_FILE, merged_poll)
             _save_json(REACTIONS_STATE_FILE, merged_reactions)
+            _save_json(ALERT_STATE_FILE, merged_alert)
+            _save_json(STATUS_FILE, merged_status)
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -1197,6 +1342,20 @@ def main():
 
     dt_msk = now_msk()
     day_key = today_key(dt_msk)
+
+    # Признаки 3/4: считаем "тишину" один раз в начале запуска — до того,
+    # как что-либо в этом запуске может обновить last_run.json — иначе
+    # алерт никогда не сработает (свежая публикация всегда обнулит elapsed).
+    elapsed_at_start = seconds_since_last_publish()
+    new_alert_timestamp = check_silence_alert(elapsed_at_start)
+
+    def persist_with_status(sent_count=None, note="", **kwargs):
+        status = build_status_snapshot(elapsed_at_start, sent_count=sent_count, note=note)
+        persist_state_to_git(
+            new_alert_timestamp=new_alert_timestamp,
+            new_status=status,
+            **kwargs,
+        )
 
     # --- Реакции: включаем один раз, статус запоминаем, чтобы не дёргать API зря ---
     reactions_state = _load_json(REACTIONS_STATE_FILE, {"enabled": False})
@@ -1265,7 +1424,9 @@ def main():
                 new_digest_state = digest_state
                 mark_published_now()
 
-                persist_state_to_git(
+                persist_with_status(
+                    sent_count=len(finalized),
+                    note=f"digest:{slot}",
                     new_posted_ids=new_posted_ids,
                     new_title_words_list=new_title_words_list,
                     new_last_publish=time.time(),
@@ -1288,8 +1449,9 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_reactions_enabled:
-            persist_state_to_git(
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+            persist_with_status(
+                note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
@@ -1299,8 +1461,9 @@ def main():
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled:
-            persist_state_to_git(
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+            persist_with_status(
+                note="skip:no_news",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
@@ -1320,8 +1483,9 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_reactions_enabled:
-                persist_state_to_git(
+            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+                persist_with_status(
+                    note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                     new_reactions_enabled=new_reactions_enabled,
@@ -1339,8 +1503,9 @@ def main():
     chosen = pick_non_duplicate(ordered)
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled:
-            persist_state_to_git(
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp:
+            persist_with_status(
+                note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
@@ -1379,7 +1544,9 @@ def main():
         mark_published_now()
         new_last_publish = time.time()
 
-    persist_state_to_git(
+    persist_with_status(
+        sent_count=sent_count,
+        note="normal_post",
         new_posted_ids=new_posted_ids,
         new_title_words_list=new_title_words_list,
         new_last_publish=new_last_publish,
