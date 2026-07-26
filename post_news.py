@@ -77,6 +77,41 @@ URGENT_KEYWORDS = [
 URGENT_EMOJIS = ["🔥", "🚨", "❗️", "⚡️"]
 CHANNEL_MARK = "🔷"
 
+# Признак топ-каналов (РИА/ТАСС/РБК): категорийный эмодзи-маркер вместо
+# одного статичного значка — ускоряет сканирование ленты — плюс хэштег
+# категории в конце поста для поиска по темам внутри канала.
+CATEGORY_RULES = [
+    # (эмодзи, хэштег, ключевые слова для распознавания)
+    ("⚽️", "#спорт", [
+        "футбол", "хокке", "теннис", "матч", "турнир", "чемпионат", "сборная",
+        "гол", "тренер", "клуб", "лига", "олимпиад", "спортсмен", "чм-",
+    ]),
+    ("🚨", "#происшествия", [
+        "погиб", "убит", "жертв", "дтп", "авари", "пожар", "взрыв", "теракт",
+        "эвакуац", "чрезвычайн", "пострадал", "разыскива", "задержан", "суд",
+    ]),
+    ("💹", "#экономика", [
+        "рубл", "доллар", "евро", "инфляц", "цб", "банк", "бюджет", "налог",
+        "экспорт", "импорт", "санкц", "нефт", "газ", "акци", "биржа",
+    ]),
+    ("🏛", "#политика", [
+        "путин", "госдума", "правительств", "министр", "закон", "указ",
+        "переговор", "саммит", "президент", "депутат", "заседан",
+    ]),
+    ("💻", "#технологии", [
+        "ии", "искусственн интеллект", "смартфон", "приложен", "стартап",
+        "кибер", "робот", "гаджет", "нейросет", "разработчик",
+    ]),
+]
+
+
+def detect_category(title, summary=""):
+    t = (title + " " + summary).lower()
+    for emoji, hashtag, keywords in CATEGORY_RULES:
+        if any(kw in t for kw in keywords):
+            return emoji, hashtag
+    return CHANNEL_MARK, None
+
 
 def is_urgent(title, summary=""):
     t = (title + " " + summary).lower()
@@ -154,7 +189,10 @@ def strip_source_mentions(text):
     return text
 
 
-def truncate_at_word(text, max_len=90):
+HEADLINE_MAX_LEN = 55  # в ленте Telegram видно ~35-55 символов заголовка
+
+
+def truncate_at_word(text, max_len=HEADLINE_MAX_LEN):
     if not text or len(text) <= max_len:
         return text
     cut = text[:max_len]
@@ -162,6 +200,85 @@ def truncate_at_word(text, max_len=90):
     if last_space > 0:
         cut = cut[:last_space]
     return cut.rstrip(" ,.;:—-") + "…"
+
+
+# Признак 4: типовые канцелярские вводные, которыми AI (и журналисты
+# низкого качества) любят открывать новость, ничего не добавляя по сути.
+CLICHE_OPENER_PATTERNS = [
+    r'^как\s+(сообщается|стало известно|уточняется|сообщают|отмечается)[,:]?\s*',
+    r'^по\s+(имеющимся\s+)?данным(\s+источник[а-я]*)?[,:]?\s*',
+    r'^по\s+словам\s+[^,]+[,:]?\s*',
+    r'^стало\s+известно,?\s+что\s*',
+    r'^напомним,?\s*',
+    r'^следует\s+отметить,?\s+что\s*',
+]
+
+
+def strip_cliche_openers(text):
+    if not text:
+        return text
+    result = text
+    for pattern in CLICHE_OPENER_PATTERNS:
+        result = re.sub(pattern, "", result, flags=re.IGNORECASE)
+    if result:
+        result = result[0].upper() + result[1:]
+    return result.strip()
+
+
+def fix_shouty_caps(text):
+    # Признак 5: заголовок КАПСОМ выглядит как спам — если больше 60%
+    # букв заглавные, приводим к обычному предложенческому регистру.
+    if not text:
+        return text
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return text
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio > 0.6:
+        text = text.lower()
+        text = text[0].upper() + text[1:] if text else text
+    return text
+
+
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\u2B00-\u2BFF\u2190-\u21FF\u2300-\u23FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_decorative_emoji(text):
+    # Признак 3: убираем эмодзи, которые могла добавить сама AI —
+    # маркер категории/срочности бот уже ставит сам, дублирование эмодзи
+    # выглядит любительски.
+    if not text:
+        return text
+    text = _EMOJI_PATTERN.sub("", text)
+    return re.sub(r'\s{2,}', ' ', text).strip()
+
+
+def collapse_repeated_punctuation(text):
+    # Признак 7: "!!!", "???", "...." — убираем до одного знака.
+    if not text:
+        return text
+    text = re.sub(r'!{2,}', '!', text)
+    text = re.sub(r'\?{2,}', '?', text)
+    text = re.sub(r'\.{4,}', '…', text)
+    return text
+
+
+def sanitize_text(text):
+    # Финальная санитаризация перед отправкой (признак 10): прогоняет
+    # все точечные чистки разом и убирает случайные двойные пробелы,
+    # которые могли остаться после предыдущих замен.
+    text = strip_decorative_emoji(text)
+    text = collapse_repeated_punctuation(text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
 
 
 def source_name(link):
@@ -326,16 +443,25 @@ def rewrite_with_ai(title, summary):
         prompt_lines = [
             "Ты — редактор новостного Telegram-канала уровня РБК. Сделай из новости пост в 2 частях.",
             "",
-            "1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце (5-9 слов)",
+            "1) ЗАГОЛОВОК — короткий, конкретный, без кавычек и точки в конце, "
+            "СТРОГО не длиннее 55 символов (в ленте Telegram видно только начало "
+            "заголовка, длинный обрежется на середине слова)",
             "2) ТЕКСТ — СТРОГО не более 7 предложений, живым языком, без канцелярита. "
             "Только самое важное: что произошло, кто участвует, ключевые цифры/факты и "
             "главное последствие. Без второстепенных деталей, без предыстории и лишних "
-            "подробностей — только суть.",
+            "подробностей — только суть. Одно предложение — одна мысль, без вложенных "
+            "оборотов через запятую.",
             "",
             "ВАЖНО: если в исходной новости событие описано как предположение, план или "
             "условие (может быть, планируется, по данным источника, предположительно) — "
             "сохрани эту неопределённость и в заголовке, и в тексте. Не выдавай "
             "предположение или чьё-то заявление за свершившийся факт.",
+            "",
+            "Не используй кликбейт-слова и штампы: 'шок', 'невероятно', 'вы не поверите', "
+            "'сенсация', а также вводные канцеляризмы в начале текста вроде 'как сообщается', "
+            "'как стало известно', 'по имеющимся данным' — начинай сразу с сути. "
+            "Не добавляй свои эмодзи ни в заголовок, ни в текст — они не нужны, "
+            "оформление уже добавляет их отдельно. Не пиши заголовок КАПСОМ.",
             "",
             f"Заголовок исходной новости: {title}",
             f"Краткое содержание: {summary if summary else 'нет'}",
@@ -468,7 +594,11 @@ def fetch_news():
     recent_content_words = load_recent_title_words()
     new_items = []
     seen_title_keys = set()
-    seen_content_words = []
+    # Признак 6/9: список содержит и слова, и источник, и индекс в
+    # new_items — нужен, чтобы при встрече похожей новости от ДРУГОГО
+    # канала не просто отбросить дубль, а пометить уже сохранённый
+    # оригинал как «подтверждено несколькими источниками».
+    seen_items_meta = []
 
     if not os.path.exists(FEEDS_FILE):
         print("[ERROR] feeds.txt not found!")
@@ -500,17 +630,33 @@ def fetch_news():
             if title_key in posted or title_key in seen_title_keys:
                 continue
 
+            # Признак 8: защита от обрубленных заголовков — если в
+            # заголовке меньше 3 значимых слов, это почти всегда обрывок
+            # текста (например, канал разбил пост на несколько строк, а
+            # мы забрали только первую), публиковать такое нельзя.
+            if len(significant_title_words(title)) < 3:
+                continue
+
             raw_summary = entry.get("summary", entry.get("description", ""))
             summary = strip_source_mentions(html.unescape(re.sub(r"<[^>]+>", "", raw_summary)))
             link = entry.get("link", "")
+            source_channel = entry.get("source_channel") or ""
 
             # ФИКС: сравниваем по словам заголовка + summary вместе (не
             # только заголовка), потому что разные каналы часто по-разному
             # формулируют заголовок про одно и то же событие, а факты в
             # тексте (summary) обычно совпадают.
             c_words = content_words(title, summary)
-            if is_duplicate_by_meaning(c_words, recent_content_words) or \
-               any(titles_are_similar(c_words, w) for w in seen_content_words):
+            if is_duplicate_by_meaning(c_words, recent_content_words):
+                continue
+
+            dup_meta = next((m for m in seen_items_meta if titles_are_similar(c_words, m["words"])), None)
+            if dup_meta is not None:
+                if dup_meta["source_channel"] != source_channel:
+                    # Другой канал независимо сообщает о том же событии —
+                    # не публикуем второй раз, но помечаем оригинал как
+                    # подтверждённый несколькими источниками.
+                    new_items[dup_meta["idx"]]["confirmed_multi_source"] = True
                 continue
 
             if is_not_news(title, summary):
@@ -522,7 +668,7 @@ def fetch_news():
             if not photo and not video:
                 continue
 
-            src = f"@{entry['source_channel']}" if entry.get("source_channel") else source_name(link)
+            src = f"@{source_channel}" if source_channel else source_name(link)
             urgent = is_urgent(title, summary)
             print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
 
@@ -531,7 +677,9 @@ def fetch_news():
                 "title_key": title_key,
                 "content_words": list(c_words),
                 "source": src,
+                "source_channel": source_channel,
                 "urgent": urgent,
+                "confirmed_multi_source": False,
                 "title": title,
                 "summary": summary,
                 "link": link,
@@ -541,22 +689,53 @@ def fetch_news():
                 "published": entry.get("published", datetime.now().isoformat())
             })
             seen_title_keys.add(title_key)
-            seen_content_words.append(c_words)
+            seen_items_meta.append({
+                "words": c_words,
+                "idx": len(new_items) - 1,
+                "source_channel": source_channel,
+            })
 
     return new_items
+
+
+def paragraphize(text, sentences_per_para=2):
+    # Признак топ-каналов: короткие абзацы (1-2 предложения), а не
+    # сплошной блок текста — читается заметно быстрее с телефона.
+    if not text:
+        return text
+    sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    if len(sentences) <= sentences_per_para:
+        return text
+    paras = []
+    for i in range(0, len(sentences), sentences_per_para):
+        paras.append(" ".join(sentences[i:i + sentences_per_para]))
+    return "\n\n".join(paras)
 
 
 def finalize_item(item):
     rewritten = rewrite_with_ai(item["title"], item["summary"])
     if rewritten:
-        item["headline"] = html.escape(rewritten["headline"])
-        item["body"] = html.escape(limit_sentences(strip_source_mentions(rewritten["body"])))
+        headline_raw = rewritten["headline"]
+        body_raw = limit_sentences(strip_source_mentions(rewritten["body"]))
     else:
         source_text = item["summary"] if item["summary"] else item["title"]
         sentences = [s for s in re.split(r'(?<=[.!?])\s+', source_text.strip()) if s]
-        item["headline"] = html.escape(truncate_at_word(sentences[0], 90)) if sentences else html.escape(truncate_at_word(item["title"], 90))
-        rest = " ".join(sentences[1:MAX_SENTENCES + 1])
-        item["body"] = html.escape(rest) if rest else ""
+        headline_raw = sentences[0] if sentences else item["title"]
+        body_raw = " ".join(sentences[1:MAX_SENTENCES + 1])
+
+    # Признаки 3/4/5/7: убираем decorative-эмодзи от AI, клише-вставки,
+    # КАПС и повторяющуюся пунктуацию — до экранирования HTML и до обрезки.
+    headline_raw = fix_shouty_caps(strip_cliche_openers(sanitize_text(headline_raw)))
+    body_raw = strip_cliche_openers(sanitize_text(body_raw))
+
+    item["headline"] = html.escape(truncate_at_word(headline_raw)) if headline_raw else html.escape(truncate_at_word(item["title"]))
+    item["body"] = html.escape(paragraphize(body_raw)) if body_raw else ""
+
+    item["category"] = detect_category(item["title"], item.get("summary", ""))
+
+    # Признак 5: короткая атрибуция источника в конце поста — просто
+    # @handle канала-первоисточника, без ссылки и без цитирования текста.
+    item["attribution"] = item.get("source") if item.get("source_channel") else None
     return item
 
 
@@ -711,13 +890,37 @@ def send_post(item, text):
 
 
 def format_post(item, extra=""):
-    lead = f"{random.choice(URGENT_EMOJIS)} " if item.get("urgent") else ""
-    text = f"{CHANNEL_MARK} {lead}<b>{item['headline']}</b>"
+    # Срочная новость — обычный "срочный" эмодзи-акцент, как раньше.
+    # Иначе — категорийный маркер (⚽️/🚨/💹/🏛/💻) вместо статичного 🔷,
+    # плюс хэштег категории в конце поста, если категория распознана.
+    category_emoji, hashtag = item.get("category", (CHANNEL_MARK, None))
+    if item.get("urgent"):
+        mark = random.choice(URGENT_EMOJIS)
+    else:
+        mark = category_emoji
+    text = f"{mark} <b>{item['headline']}</b>"
     if item.get("body"):
         text += f"\n\n{item['body']}"
+
+    # Признак 6: если новость независимо подтвердили 2+ разных канала в
+    # пуле кандидатов — это реальный сигнал достоверности, как у крупных
+    # агентств, которые не публикуют неподтверждённые вбросы одного канала.
+    if item.get("confirmed_multi_source"):
+        text += "\n\n✅ Подтверждено несколькими источниками"
+
     if extra:
         text += f"\n\n{extra}"
+    if hashtag and not item.get("urgent"):
+        text += f"\n\n{hashtag}"
+
+    # Признак 5: короткая атрибуция первоисточника — без ссылки, без
+    # цитирования текста, просто @handle канала (не нарушает копирайт,
+    # но повышает прозрачность/доверие).
+    if item.get("attribution"):
+        text += f"\n\n{html.escape(item['attribution'])}"
+
     return text
+
 
 
 def get_subscriber_count():
@@ -856,7 +1059,10 @@ def enable_reactions():
 def format_digest(items, slot_label):
     lines = [f"{CHANNEL_MARK} <b>{slot_label}</b>", ""]
     for i, it in enumerate(items, 1):
-        lines.append(f"{i}. <b>{it['headline']}</b>")
+        # Признак 7: категорийный эмодзи и в дайджесте, не только в
+        # одиночных постах — единообразие визуального языка канала.
+        cat_emoji, _ = it.get("category", (CHANNEL_MARK, None))
+        lines.append(f"{i}. {cat_emoji} <b>{it['headline']}</b>")
         if it.get("body"):
             first_sentence = it["body"].split(". ")[0].rstrip(".") + "."
             lines.append(first_sentence)
