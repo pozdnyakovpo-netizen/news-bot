@@ -959,7 +959,7 @@ def fetch_telegram_channel(username, limit=20):
     return entries[::-1]
 
 
-def fetch_news():
+def fetch_news(require_media=True, skip_not_news_filter=False):
     posted = load_posted()
     recent_content_words = load_recent_title_words()
     new_items = []
@@ -1014,7 +1014,7 @@ def fetch_news():
                     new_items[dup_meta["idx"]]["confirmed_multi_source"] = True
                 continue
 
-            if is_not_news(title, summary):
+            if not skip_not_news_filter and is_not_news(title, summary):
                 continue
 
             # ФИКС (найдено при разборе жалобы "давно нет новостей"): раньше
@@ -1029,7 +1029,7 @@ def fetch_news():
             photo = entry.get("photo")
             photo_bytes = entry.get("photo_bytes")
             video = entry.get("video")
-            if not photo and not video and not urgent:
+            if require_media and not photo and not video and not urgent:
                 continue
 
             src = f"@{source_channel}" if source_channel else source_name(link)
@@ -2616,17 +2616,33 @@ def main():
 
     news = fetch_news()
     if not news:
-        print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
-            persist_with_status(
-                note="skip:no_news",
-                new_digest_state=new_digest_state,
-                new_poll_state=new_poll_state,
-                new_weekly_recap_state=new_weekly_recap_state,
-                new_quiz_state=new_quiz_state,
-                new_market_state=new_market_state,
-            )
-        return
+        # ФИКС ("радикально и наверняка"): раньше, если строгий fetch_news()
+        # (с требованием фото/видео и фильтром "не новость") не находил
+        # вообще НИЧЕГО, бот сдавался здесь безвозвратно — аварийный режим
+        # гарантии частоты (pick_any_not_posted) ниже до этой точки просто
+        # не доходил, потому что применялся только к уже найденным
+        # кандидатам. Это была последняя лазейка, через которую тишина
+        # могла тянуться сколько угодно. Теперь, если давно не было
+        # публикации, пробуем СМЯГЧЁННЫЙ повторный проход по тем же
+        # источникам — без требования фото/видео и без фильтра "не
+        # новость" — и берём оттуда что угодно ещё не опубликованное.
+        if elapsed is not None and elapsed >= GUARANTEED_CADENCE_SECONDS:
+            print(f"[INFO] Строгий поиск не нашёл вообще ничего, а с последней публикации "
+                  f"прошло {int(elapsed)} сек — пробуем смягчённый поиск (без требования "
+                  f"фото/видео, без фильтра «не новость») для гарантии частоты публикаций.")
+            news = fetch_news(require_media=False, skip_not_news_filter=True)
+        if not news:
+            print("[INFO] No new news.")
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
+                persist_with_status(
+                    note="skip:no_news",
+                    new_digest_state=new_digest_state,
+                    new_poll_state=new_poll_state,
+                    new_weekly_recap_state=new_weekly_recap_state,
+                    new_quiz_state=new_quiz_state,
+                    new_market_state=new_market_state,
+                )
+            return
 
     urgent_items = [it for it in news if it.get("urgent")]
     normal_items = [it for it in news if not it.get("urgent")]
