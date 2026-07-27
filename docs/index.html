@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>deepdailyfact — статус канала</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #4fd1c5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px 64px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-top: 0; margin-bottom: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+  .card .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 6px; }
+  .card.wide { grid-column: 1 / -1; }
+  .sparkline { width: 100%; height: auto; margin-top: 8px; }
+  .spark-label { fill: var(--muted); font-size: 11px; }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .bar-label { width: 140px; font-size: 0.85rem; color: var(--muted); flex-shrink: 0; }
+  .bar-track { flex: 1; background: #21262d; border-radius: 6px; height: 10px; overflow: hidden; }
+  .bar-fill { background: var(--accent); height: 100%; border-radius: 6px; }
+  .bar-count { width: 36px; text-align: right; font-size: 0.85rem; color: var(--muted); }
+  ul { list-style: none; padding: 0; margin: 8px 0 0; }
+  li { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.92rem; }
+  li:last-child { border-bottom: none; }
+  .cat-emoji { margin-right: 8px; }
+  .muted { color: var(--muted); }
+  footer { color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📡 deepdailyfact</h1>
+  <p class="subtitle">Живая статистика новостного канала · <a href="https://t.me/deepdailyfact">открыть канал</a></p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Статус</div>
+      <div class="value" style="font-size:1.1rem">🟢 Работает штатно</div>
+    </div>
+    <div class="card">
+      <div class="label">Последняя публикация</div>
+      <div class="value" style="font-size:1.1rem">49 мин назад</div>
+    </div>
+    <div class="card">
+      <div class="label">Подписчиков</div>
+      <div class="value">2</div>
+    </div>
+    <div class="card">
+      <div class="label">Скорость публикации (медиана)</div>
+      <div class="value">73 мин</div>
+    </div>
+  </div>
+
+  <div class="card wide">
+    <div class="label">Рост подписчиков</div>
+    <p class="muted">Накапливаем историю — график появится через несколько дней</p>
+  </div>
+
+  <div class="grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="card">
+      <div class="label">Вклад источников (последние посты)</div>
+      <div class="bar-row"><span class="bar-label">неизвестно</span><div class="bar-track"><div class="bar-fill" style="width:100%"></div></div><span class="bar-count">24</span></div><div class="bar-row"><span class="bar-label">@astrapress</span><div class="bar-track"><div class="bar-fill" style="width:4%"></div></div><span class="bar-count">1</span></div><div class="bar-row"><span class="bar-label">@milinfolive</span><div class="bar-track"><div class="bar-fill" style="width:4%"></div></div><span class="bar-count">1</span></div><div class="bar-row"><span class="bar-label">@rgrunews</span><div class="bar-track"><div class="bar-fill" style="width:4%"></div></div><span class="bar-count">1</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Последние новости</div>
+      <ul><li><span class="cat-emoji">🚨</span>Следственные органы возбудили уголовное дело после трагической аварии в Сочи с пятью погибшими</li><li><span class="cat-emoji">🚨</span>Прилет по ТЦ «Эпицентр» в Кривом Роге и пожар после.   Военный Осведомитель</li><li><span class="cat-emoji">🚨</span>После сообщений об эвакуациях сотрудников Wildberries в</li><li><span class="cat-emoji">🚨</span>В Севастополе ограничили подачу электричества</li><li><span class="cat-emoji">🏛</span>Трамп приостановил новые удары по Ирану после почти двух недель атак из-за сокращения ракет ПВО и стремления…</li><li><span class="cat-emoji">🚨</span>В результате российского авиаудара по Изюму Харьковской области трое человек получили ранения, —</li><li><span class="cat-emoji">🏛</span>Более 75% жителей Польши отрицательно относятся к Владимиру Зеленскому, следует из результатов опроса…</li><li><span class="cat-emoji">🚨</span>Европа не может справиться с потоком контрабанды кокаина несмотря на ужесточение мер по борьбе с наркотиками…</li><li><span class="cat-emoji">💹</span>Алла Пугачёва четыре месяца была прикована к кровати из-за перелома ноги — поэтому она сейчас ходит с тростью</li><li><span class="cat-emoji">🚨</span>Пользователи Apple потеряли более 140 млн рублей из-за скам-приложения в App Store…</li><li><span class="cat-emoji">🚨</span>Знаменитой обезьянке Панчу сегодня исполнился 1 годик. Малышу, за судьбой которого переживал и следил весь…</li><li><span class="cat-emoji">🏛</span>Дональд Трамп метит на третий президентский срок в США. Американский лидер опубликовал серию новых постов в…</li></ul>
+    </div>
+  </div>
+
+  <footer>Обновляется автоматически ботом · последнее обновление: 27.07.2026 13:53 мск</footer>
+</div>
+</body>
+</html>
