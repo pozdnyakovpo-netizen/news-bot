@@ -1103,6 +1103,99 @@ def compute_engagement_stats(views_history):
     }
 
 
+# --- "Хочу RSS, но чтобы не было конфликта" — параллельный источник
+# новостей из официальных RSS-лент федеральных изданий ---
+# Полностью отдельный конфиг-файл (rss_feeds.txt) и отдельная функция
+# сбора — никак не пересекается по коду с Telegram-скрейпингом. Все
+# кандидаты, независимо от источника, проходят через ОДИН и тот же
+# _process_candidate_entry() (см. ниже), поэтому дедуп/фильтры работают
+# идентично и не могут разойтись между источниками. Сбой одной ленты
+# (сеть, невалидный XML) ловится локально и не мешает остальным.
+RSS_FEEDS_FILE = "rss_feeds.txt"
+RSS_FETCH_LIMIT_PER_FEED = 20
+
+
+def load_rss_feeds_list():
+    if not os.path.exists(RSS_FEEDS_FILE):
+        return []
+    urls = []
+    with open(RSS_FEEDS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not (line.startswith("http://") or line.startswith("https://")):
+                # Строка не похожа на URL — пропускаем её одну, а не всю
+                # ленту: та же философия самодиагностики, что и для
+                # feeds.txt, только здесь достаточно проверки построчно,
+                # без риска "выключить" весь список из-за одной опечатки.
+                print(f"[WARN] rss_feeds.txt: строка не похожа на URL, пропускаем: {line[:60]!r}")
+                continue
+            urls.append(line)
+    return urls
+
+
+def fetch_rss_feed(url, limit=RSS_FETCH_LIMIT_PER_FEED):
+    try:
+        resp = request_with_retry("GET", url, timeout=FETCH_TIMEOUT, headers=TELEGRAM_PREVIEW_HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[WARN] RSS fetch failed for {url}: {e}")
+        return []
+
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        print(f"[WARN] RSS parse failed for {url}: {e}")
+        return []
+
+    channel = root.find("channel")
+    items = channel.findall("item") if channel is not None else root.findall(".//item")
+
+    entries = []
+    for item in items[:limit]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not title or not link:
+            continue
+        description_raw = item.findtext("description") or ""
+        description = re.sub(r"<[^>]+>", "", html.unescape(description_raw)).strip()
+
+        published = None
+        pub_date_raw = item.findtext("pubDate")
+        if pub_date_raw:
+            try:
+                from email.utils import parsedate_to_datetime
+                published = parsedate_to_datetime(pub_date_raw).isoformat()
+            except Exception:
+                published = None
+
+        photo = None
+        enclosure = item.find("enclosure")
+        if enclosure is not None:
+            enc_type = enclosure.get("type", "") or ""
+            enc_url = enclosure.get("url")
+            if enc_url and enc_type.startswith("image"):
+                photo = enc_url
+
+        entries.append({
+            "id": link,
+            "title": title[:200],
+            "summary": description,
+            "link": link,
+            "photo": photo,
+            "photo_bytes": None,
+            "video": None,
+            "published": published or datetime.now().isoformat(),
+            # Префикс "rss:" явно отличает источник от Telegram-username в
+            # статистике (source_contribution на дашборде/медиаките) — не
+            # смешивается и не путается с @channel.
+            "source_channel": f"rss:{source_name(link) or url}",
+        })
+    return entries
+
+
 def fetch_telegram_channel(username, limit=20):
     url = f"https://t.me/s/{username}"
     try:
@@ -1177,6 +1270,84 @@ def fetch_telegram_channel(username, limit=20):
     return entries[::-1]
 
 
+def _process_candidate_entry(entry, posted, seen_title_keys, seen_items_meta, recent_content_words,
+                              new_items, require_media, skip_not_news_filter, force_allow_no_media=False):
+    # ФИКС ("хочу RSS, но чтобы не было конфликта"): раньше вся эта логика
+    # жила прямо внутри цикла по Telegram-каналам в fetch_news(). Чтобы
+    # добавить второй источник (RSS) без риска рассинхронизировать
+    # правила фильтрации/дедупа между двумя источниками, вся проверка
+    # кандидата вынесена в ОДНУ общую функцию — и Telegram-каналы, и
+    # RSS-ленты проходят через неё одинаково. Правило для отдельного
+    # источника — только force_allow_no_media (RSS официальных агентств
+    # часто не даёт фото/видео, но сама новость уже проверена редакцией
+    # источника, поэтому требование медиа для RSS не применяется).
+    entry_id = entry.get("id") or entry.get("link")
+    if not entry_id or entry_id in posted:
+        return False
+
+    title = html.unescape(entry.get("title", "Без заголовка"))
+    title_key = title_dedup_key(title)
+    if title_key in posted or title_key in seen_title_keys:
+        return False
+
+    if len(significant_title_words(title)) < 3:
+        return False
+
+    raw_summary = entry.get("summary", entry.get("description", ""))
+    summary = strip_source_mentions(html.unescape(re.sub(r"<[^>]+>", "", raw_summary)))
+    link = entry.get("link", "")
+    source_channel = entry.get("source_channel") or ""
+
+    c_words = content_words(title, summary)
+    if is_duplicate_by_meaning(c_words, recent_content_words):
+        return False
+
+    dup_meta = next((m for m in seen_items_meta if titles_are_similar(c_words, m["words"])), None)
+    if dup_meta is not None:
+        if dup_meta["source_channel"] != source_channel:
+            new_items[dup_meta["idx"]]["confirmed_multi_source"] = True
+        return False
+
+    if not skip_not_news_filter and is_not_news(title, summary):
+        return False
+
+    urgent = is_urgent(title, summary)
+    photo = entry.get("photo")
+    photo_bytes = entry.get("photo_bytes")
+    video = entry.get("video")
+    if require_media and not force_allow_no_media and not photo and not video and not urgent:
+        return False
+
+    src = f"@{source_channel}" if (source_channel and not source_channel.startswith("rss:")) else (
+        source_channel[4:] if source_channel.startswith("rss:") else source_name(link)
+    )
+    print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}, urgent={urgent}")
+
+    new_items.append({
+        "id": entry_id,
+        "title_key": title_key,
+        "content_words": list(c_words),
+        "source": src,
+        "source_channel": source_channel,
+        "urgent": urgent,
+        "confirmed_multi_source": False,
+        "title": title,
+        "summary": summary,
+        "link": link,
+        "photo": photo,
+        "photo_bytes": photo_bytes,
+        "video": video,
+        "published": entry.get("published", datetime.now().isoformat())
+    })
+    seen_title_keys.add(title_key)
+    seen_items_meta.append({
+        "words": c_words,
+        "idx": len(new_items) - 1,
+        "source_channel": source_channel,
+    })
+    return True
+
+
 def fetch_news(require_media=True, skip_not_news_filter=False):
     posted = load_posted()
     recent_content_words = load_recent_title_words()
@@ -1204,77 +1375,27 @@ def fetch_news(require_media=True, skip_not_news_filter=False):
         for entry in channel_entries:
             if len(new_items) >= FETCH_POOL_SIZE:
                 break
+            _process_candidate_entry(entry, posted, seen_title_keys, seen_items_meta,
+                                      recent_content_words, new_items, require_media, skip_not_news_filter)
 
-            entry_id = entry.get("id") or entry.get("link")
-            if not entry_id or entry_id in posted:
-                continue
-
-            title = html.unescape(entry.get("title", "Без заголовка"))
-            title_key = title_dedup_key(title)
-            if title_key in posted or title_key in seen_title_keys:
-                continue
-
-            if len(significant_title_words(title)) < 3:
-                continue
-
-            raw_summary = entry.get("summary", entry.get("description", ""))
-            summary = strip_source_mentions(html.unescape(re.sub(r"<[^>]+>", "", raw_summary)))
-            link = entry.get("link", "")
-            source_channel = entry.get("source_channel") or ""
-
-            c_words = content_words(title, summary)
-            if is_duplicate_by_meaning(c_words, recent_content_words):
-                continue
-
-            dup_meta = next((m for m in seen_items_meta if titles_are_similar(c_words, m["words"])), None)
-            if dup_meta is not None:
-                if dup_meta["source_channel"] != source_channel:
-                    new_items[dup_meta["idx"]]["confirmed_multi_source"] = True
-                continue
-
-            if not skip_not_news_filter and is_not_news(title, summary):
-                continue
-
-            # ФИКС (найдено при разборе жалобы "давно нет новостей"): раньше
-            # ЛЮБАЯ новость без фото/видео отбрасывалась безусловно — в том
-            # числе СРОЧНАЯ (is_urgent), хотя срочные алерты у источников
-            # почти всегда текстовые (эвакуация/теракт/ЧС публикуются раньше,
-            # чем появляется фото с места). Из-за этого бот мог полностью
-            # "молчать" часами, если у всех источников в моменте не оказалось
-            # ни одной новости с медиа, даже когда реальные срочные события
-            # были. Срочные новости больше не требуют фото/видео.
-            urgent = is_urgent(title, summary)
-            photo = entry.get("photo")
-            photo_bytes = entry.get("photo_bytes")
-            video = entry.get("video")
-            if require_media and not photo and not video and not urgent:
-                continue
-
-            src = f"@{source_channel}" if source_channel else source_name(link)
-            print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}, urgent={urgent}")
-
-            new_items.append({
-                "id": entry_id,
-                "title_key": title_key,
-                "content_words": list(c_words),
-                "source": src,
-                "source_channel": source_channel,
-                "urgent": urgent,
-                "confirmed_multi_source": False,
-                "title": title,
-                "summary": summary,
-                "link": link,
-                "photo": photo,
-                "photo_bytes": photo_bytes,
-                "video": video,
-                "published": entry.get("published", datetime.now().isoformat())
-            })
-            seen_title_keys.add(title_key)
-            seen_items_meta.append({
-                "words": c_words,
-                "idx": len(new_items) - 1,
-                "source_channel": source_channel,
-            })
+    # --- RSS-источники (федеральные агентства) — второй, независимый
+    # источник кандидатов, обрабатывается ТЕМ ЖЕ helper'ом выше, поэтому
+    # дедуп/фильтры для него ничем не отличаются от Telegram-каналов.
+    # Один сломанный RSS-фид (сеть, невалидный XML) не мешает остальным —
+    # ошибка ловится внутри fetch_rss_feed и просто пропускается.
+    if len(new_items) < FETCH_POOL_SIZE:
+        rss_urls = load_rss_feeds_list()
+        random.shuffle(rss_urls)
+        for url in rss_urls:
+            if len(new_items) >= FETCH_POOL_SIZE:
+                break
+            rss_entries = fetch_rss_feed(url)
+            for entry in rss_entries:
+                if len(new_items) >= FETCH_POOL_SIZE:
+                    break
+                _process_candidate_entry(entry, posted, seen_title_keys, seen_items_meta,
+                                          recent_content_words, new_items, require_media,
+                                          skip_not_news_filter, force_allow_no_media=True)
 
     return new_items
 
