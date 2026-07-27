@@ -573,6 +573,115 @@ def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts
     return False
 
 
+def find_matching_post(candidate_title, candidate_summary, recent_posts, exclude_entities=None):
+    # То же самое, что is_duplicate_word_or_entity, но возвращает САМ
+    # найденный пост (а не просто True/False) — нужен, чтобы понять, какой
+    # именно ранее опубликованный пост совпал по теме, и сравнить цифры
+    # (см. find_updated_fact ниже — "крутая" фича автоматических уточнений).
+    for post in recent_posts:
+        if is_same_event(candidate_title, candidate_summary,
+                          post.get("headline", ""), post.get("summary", ""),
+                          exclude_entities=exclude_entities):
+            return post
+    return None
+
+
+# --- "Крутая" фича: автоматические уточнения по изменившимся фактам ---
+# Когда новый кандидат оказывается дублем уже опубликованной новости (то же
+# место/событие), но при этом ключевая цифра — число погибших/раненых/
+# пострадавших/жертв — ИЗМЕНИЛАСЬ (обычная ситуация: сначала "трое
+# погибших", через час "пятеро погибших"), бот раньше просто тихо
+# отбрасывал такую новость как дубль — читатель никогда не узнавал, что
+# цифра выросла. Теперь вместо этого публикуется короткое явное
+# "🔄 Уточнение" с новой цифрой и ссылкой на исходный пост — редкая для
+# автоматических каналов функция точности, а не только скорости.
+FACT_UPDATE_KEYWORDS = ["погиб", "ранен", "пострадал", "жертв"]
+RU_NUMBER_WORDS = {
+    "один": 1, "одна": 1, "одного": 1, "одну": 1,
+    "двое": 2, "два": 2, "две": 2, "двух": 2,
+    "трое": 3, "три": 3, "трёх": 3, "трех": 3,
+    "четверо": 4, "четыре": 4, "четырёх": 4, "четырех": 4,
+    "пятеро": 5, "пять": 5, "пятерых": 5,
+    "шестеро": 6, "шесть": 6, "шестерых": 6,
+    "семеро": 7, "семь": 7, "семерых": 7,
+    "восьмеро": 8, "восемь": 8, "восьмерых": 8,
+    "девятеро": 9, "девять": 9, "девятерых": 9,
+    "десять": 10, "десятеро": 10, "десятерых": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13,
+    "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20,
+}
+
+
+def _word_to_number(token):
+    if token.isdigit():
+        return int(token)
+    return RU_NUMBER_WORDS.get(token)
+
+
+def extract_fact_numbers(text, keywords=FACT_UPDATE_KEYWORDS, window=3):
+    if not text:
+        return {}
+    tokens = re.findall(r'[а-яё\d]+', text.lower())
+    result = {}
+    for kw in keywords:
+        for i, tok in enumerate(tokens):
+            if tok.startswith(kw):
+                nearby = tokens[max(0, i - window):i] + tokens[i + 1:i + window + 1]
+                for w in nearby:
+                    n = _word_to_number(w)
+                    if n is not None:
+                        result[kw] = n
+                        break
+                if kw in result:
+                    break
+    return result
+
+
+def find_updated_fact(candidate_title, candidate_summary, matched_post):
+    # Сравнивает цифры кандидата с цифрами уже опубликованного поста,
+    # которому он соответствует по теме. Возвращает (ключевое_слово,
+    # старое_число, новое_число), если хоть одна цифра изменилась, иначе
+    # None. Публикуем уточнение только когда новое число БОЛЬШЕ старого
+    # (типичная динамика таких новостей — уточнения почти всегда идут в
+    # сторону роста; если число вдруг меньше, это, скорее всего, ошибка
+    # распознавания источника, а не реальное опровержение, — на такое не
+    # реагируем, чтобы не публиковать ложные "уточнения").
+    candidate_numbers = extract_fact_numbers(candidate_title + " " + (candidate_summary or ""))
+    old_numbers = extract_fact_numbers(
+        (matched_post.get("headline", "") or "") + " " + (matched_post.get("summary", "") or "")
+    )
+    for kw, new_val in candidate_numbers.items():
+        old_val = old_numbers.get(kw)
+        if old_val is not None and new_val > old_val:
+            return (kw, old_val, new_val)
+    return None
+
+
+FACT_UPDATE_LABELS = {
+    "погиб": "погибших",
+    "ранен": "раненых",
+    "пострадал": "пострадавших",
+    "жертв": "жертв",
+}
+
+
+def format_fact_update(candidate_title, matched_post, kw, old_val, new_val):
+    label = FACT_UPDATE_LABELS.get(kw, kw)
+    original_headline = matched_post.get("headline") or matched_post.get("title", "")
+    lines = [
+        f"🔄 <b>Уточнение</b>",
+        "",
+        f"«{html.escape(truncate_at_word(original_headline, 110))}»",
+        f"Число {label} выросло: было {old_val} → стало {new_val}.",
+    ]
+    msg_id = matched_post.get("message_id")
+    if msg_id:
+        link = f"https://t.me/{CHANNEL_USERNAME}/{msg_id}"
+        lines.append(f'<a href="{link}">Исходный пост</a>')
+    return "\n".join(lines)
+
+
 STORY_CONTINUATION_WINDOW_HOURS = 48
 
 
@@ -1203,8 +1312,19 @@ def pick_non_duplicate(items):
             print(f"[INFO] '{title_short}' — дубль по смыслу (пересечение слов с недавними "
                   f"заголовками), пропускаем.")
             continue
-        if is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_now,
-                                        exclude_entities=common_entities):
+        matched_post = find_matching_post(it["title"], it.get("summary", ""), recent_posts_now,
+                                           exclude_entities=common_entities)
+        if matched_post is not None:
+            update = find_updated_fact(it["title"], it.get("summary", ""), matched_post)
+            if update is not None:
+                kw, old_val, new_val = update
+                print(f"[INFO] '{title_short}' — дубль по теме, но цифра «{kw}» выросла "
+                      f"({old_val} → {new_val}) — публикуем как уточнение, а не пропускаем.")
+                it["fact_update"] = {
+                    "matched_post": matched_post, "keyword": kw,
+                    "old_value": old_val, "new_value": new_val,
+                }
+                return it
             reasons["entity_dup"] += 1
             print(f"[INFO] '{title_short}' — дубль по именному стему, пропускаем.")
             continue
@@ -2700,6 +2820,53 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
             )
+        return
+
+    if chosen.get("fact_update"):
+        fu = chosen["fact_update"]
+        correction_text = format_fact_update(
+            chosen["title"], fu["matched_post"], fu["keyword"], fu["old_value"], fu["new_value"]
+        )
+        ok = send_to_telegram(correction_text)
+        if ok:
+            posted = load_posted()
+            posted.add(chosen["id"])
+            posted.add(chosen["title_key"])
+            save_posted(posted)
+            new_posted_ids = [chosen["id"], chosen["title_key"]]
+            new_title_words_list = []
+            if chosen.get("content_words"):
+                recent_words = load_recent_title_words()
+                recent_words.append(set(chosen["content_words"]))
+                save_recent_title_words(recent_words)
+                new_title_words_list.append(chosen["content_words"])
+            # Сохраняем обновлённую цифру как новую запись в recent_posts —
+            # так следующее сравнение (extract_fact_numbers) увидит уже
+            # ВЫРОСШЕЕ число, а не старое, и не будет повторно предлагать
+            # то же самое уточнение по кругу.
+            save_recent_posts(load_recent_posts() + [{
+                "headline": chosen.get("title", ""),
+                "summary": chosen.get("summary", ""),
+                "ts": time.time(),
+                "message_id": ok if isinstance(ok, int) else None,
+                "source": chosen.get("source", ""),
+            }])
+            mark_published_now()
+            persist_with_status(
+                sent_count=1,
+                note="fact_update",
+                new_posted_ids=new_posted_ids,
+                new_title_words_list=new_title_words_list,
+                new_last_publish=time.time(),
+                new_digest_state=new_digest_state,
+                new_poll_state=new_poll_state,
+                new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
+            )
+            print(f"[DONE] Fact update published: {fu['keyword']} {fu['old_value']} → {fu['new_value']}.")
+        else:
+            print("[WARN] Failed to send fact update — will retry next run.")
         return
 
     _recent_posts_for_continuation = load_recent_posts()
