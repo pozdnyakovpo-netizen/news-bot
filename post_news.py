@@ -61,6 +61,8 @@ GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 FEEDS_FILE = "feeds.txt"
+FEEDS_BACKUP_FILE = "feeds_backup.txt"
+SELF_HEAL_LOG_FILE = "self_heal_log.json"
 POSTED_FILE = "posted.json"
 LAST_RUN_FILE = "last_run.json"
 PUBLISH_INTERVAL = 300  # ФИКС: было 600 (10 мин) — цель "раз в 5-10 минут"
@@ -1726,7 +1728,7 @@ def order_candidates_by_priority(items, recent_posts):
     return [it for _, it in weighted]
 
 
-def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
+def build_status_snapshot(last_publish_elapsed, sent_count=None, note="", self_check=None):
     speed = speed_stats_summary(load_speed_stats())
     return {
         "last_check": datetime.utcnow().isoformat(),
@@ -1738,6 +1740,7 @@ def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
         "median_publish_latency_minutes": speed["median_minutes"],
         "speed_samples_count": speed["count"],
         "source_contribution": source_contribution_summary(load_recent_posts()),
+        "self_check": self_check or {},
     }
 
 
@@ -2354,7 +2357,8 @@ def _svg_sparkline(history, width=640, height=140, pad=24):
     """
 
 
-def build_dashboard_html(status, recent_posts, subscriber_history, source_contribution, generated_at_msk):
+def build_dashboard_html(status, recent_posts, subscriber_history, source_contribution, generated_at_msk,
+                          self_heal_log=None):
     status = status or {}
     healthy = status.get("healthy")
     health_badge = ("🟢 Работает штатно" if healthy else "🔴 Возможен сбой — новостей давно не было")
@@ -2368,6 +2372,24 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
     avg_latency = status.get("avg_publish_latency_minutes")
     median_latency = status.get("median_publish_latency_minutes")
     speed_samples = status.get("speed_samples_count") or 0
+
+    self_check = status.get("self_check") or {}
+    feeds_ok = self_check.get("feeds_ok")
+    telegram_ok = self_check.get("telegram_ok")
+    if feeds_ok is None and telegram_ok is None:
+        self_check_badge = "— нет данных —"
+    else:
+        parts = []
+        parts.append("🟢 Список каналов" if feeds_ok else "🔴 Список каналов")
+        parts.append("🟢 Telegram-токен" if telegram_ok else "🔴 Telegram-токен")
+        self_check_badge = " · ".join(parts)
+
+    self_heal_log = self_heal_log or []
+    self_heal_rows = "".join(
+        f'<li>{html.escape(datetime.fromtimestamp(e["ts"]).strftime("%d.%m %H:%M"))} — '
+        f'{html.escape(e.get("message", ""))}</li>'
+        for e in list(reversed(self_heal_log))[:6]
+    ) if self_heal_log else '<li class="muted">Пока не потребовалось ни одного автоматического исправления</li>'
 
     current_subs = subscriber_history[-1]["count"] if subscriber_history else None
     sparkline_svg = _svg_sparkline(subscriber_history)
@@ -2455,6 +2477,13 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
     {sparkline_svg or '<p class="muted">Накапливаем историю — график появится через несколько дней</p>'}
   </div>
 
+  <div class="card wide">
+    <div class="label">Автономная диагностика</div>
+    <div class="value" style="font-size:1.05rem; margin-bottom:10px;">{self_check_badge}</div>
+    <div class="label" style="margin-top:8px;">Последние автоматические исправления</div>
+    <ul>{self_heal_rows}</ul>
+  </div>
+
   <div class="grid" style="grid-template-columns: 1fr 1fr;">
     <div class="card">
       <div class="label">Вклад источников (последние посты)</div>
@@ -2479,6 +2508,7 @@ STATE_FILES = [
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
     SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE, MARKET_STATE_FILE,
     SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE, STORY_TIMELINE_STATE_FILE,
+    FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
 ]
 
 
@@ -2625,10 +2655,35 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             }
             merged_status = new_status if new_status is not None else _git_show_json(f"origin/main:{STATUS_FILE}", {})
 
+            # Захватываем ТЕКУЩЕЕ (возможно, только что самоисцелённое в
+            # этом же прогоне) содержимое feeds.txt/feeds_backup.txt ДО
+            # git reset --hard — иначе reset откатил бы файл к версии из
+            # origin/main (то есть могло бы вернуть испорченную версию
+            # обратно, стерев автоматическое восстановление).
+            local_feeds_content = None
+            if os.path.exists(FEEDS_FILE):
+                with open(FEEDS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    local_feeds_content = f.read()
+            local_feeds_backup_content = None
+            if os.path.exists(FEEDS_BACKUP_FILE):
+                with open(FEEDS_BACKUP_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    local_feeds_backup_content = f.read()
+            local_self_heal_log = load_self_heal_log()
+
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
             if reset.returncode != 0:
                 print(f"[WARN] git reset failed (attempt {attempt}): {reset.stderr}")
                 continue
+
+            if local_feeds_content is not None:
+                with open(FEEDS_FILE, "w", encoding="utf-8") as f:
+                    f.write(local_feeds_content)
+            if local_feeds_backup_content is not None:
+                with open(FEEDS_BACKUP_FILE, "w", encoding="utf-8") as f:
+                    f.write(local_feeds_backup_content)
+            remote_self_heal_log = _git_show_json(f"origin/main:{SELF_HEAL_LOG_FILE}", [])
+            merged_self_heal_log = (list(remote_self_heal_log) + local_self_heal_log)[-SELF_HEAL_LOG_LIMIT:]
+            save_self_heal_log(merged_self_heal_log)
 
             save_posted(merged_posted)
             save_recent_title_words(merged_recent)
@@ -2664,6 +2719,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                     subscriber_history=merged_subscriber_history,
                     source_contribution=source_contribution_summary(merged_recent_posts),
                     generated_at_msk=now_msk().strftime("%d.%m.%Y %H:%M"),
+                    self_heal_log=merged_self_heal_log,
                 )
                 with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
                     f.write(dashboard_html)
@@ -2707,8 +2763,184 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
         return False
 
 
+# --- "Ещё круче и глобальнее": автономный слой самодиагностики и
+# самовосстановления ---
+# За время работы бота реально случались: порча feeds.txt (в него попал
+# код Python вместо списка каналов), накопление "осиротевших"
+# закреплённых сообщений, скрытые сбои git-персистенции. Раньше все эти
+# случаи разбирались вручную, по скриншотам, шаг за шагом. Теперь бот
+# каждый прогон САМ проверяет себя по нескольким направлениям и, где
+# может, чинит проблему без участия человека — а где не может, оставляет
+# явный, видимый след (self_heal_log + карточка на дашборде), а не тихо
+# ломается.
+SELF_HEAL_LOG_LIMIT = 100
+
+
+def load_self_heal_log():
+    return _load_json(SELF_HEAL_LOG_FILE, [])
+
+
+def save_self_heal_log(entries):
+    _save_json(SELF_HEAL_LOG_FILE, entries[-SELF_HEAL_LOG_LIMIT:])
+
+
+def record_self_heal_event(kind, message):
+    log = load_self_heal_log()
+    log.append({"ts": time.time(), "kind": kind, "message": message})
+    save_self_heal_log(log)
+    print(f"[SELF-HEAL] {kind}: {message}")
+
+
+# 1) Защита от порчи feeds.txt — именно так один раз реально сломался бот
+# (список каналов оказался заменён содержимым post_news.py). Эвристика:
+# настоящий список каналов — это короткие однословные строки без
+# пробелов и без явных признаков кода; если заметная доля строк на это
+# не похожа — считаем файл испорченным и не пытаемся кормить бота
+# "каналами" вроде "def request_with_retry(...)".
+FEEDS_CORRUPTION_MARKERS = ("def ", "import ", "class ", "return ", "elif ", "except ", "= {", "==")
+FEEDS_CORRUPTION_BAD_FRACTION = 0.2
+
+
+def feeds_content_looks_corrupted(raw_text):
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        return False
+    bad = 0
+    for ln in lines:
+        if len(ln) > 60 or " " in ln or any(marker in ln for marker in FEEDS_CORRUPTION_MARKERS):
+            bad += 1
+    return (bad / len(lines)) > FEEDS_CORRUPTION_BAD_FRACTION
+
+
+def ensure_feeds_file_healthy():
+    if not os.path.exists(FEEDS_FILE):
+        return {"feeds_ok": False, "healed": False}
+    try:
+        with open(FEEDS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    except Exception as e:
+        record_self_heal_event("feeds_read_error", f"Не удалось прочитать feeds.txt: {e}")
+        return {"feeds_ok": False, "healed": False}
+
+    if not feeds_content_looks_corrupted(raw):
+        # Файл в порядке — обновляем "последнюю здоровую" резервную копию,
+        # чтобы было куда откатиться, если он испортится в будущем.
+        try:
+            with open(FEEDS_BACKUP_FILE, "w", encoding="utf-8") as f:
+                f.write(raw)
+        except Exception:
+            pass
+        return {"feeds_ok": True, "healed": False}
+
+    # Похоже на порчу — пробуем восстановить из резервной копии.
+    if os.path.exists(FEEDS_BACKUP_FILE):
+        try:
+            with open(FEEDS_BACKUP_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                backup_raw = f.read()
+        except Exception:
+            backup_raw = ""
+        if backup_raw.strip() and not feeds_content_looks_corrupted(backup_raw):
+            with open(FEEDS_FILE, "w", encoding="utf-8") as f:
+                f.write(backup_raw)
+            record_self_heal_event(
+                "feeds_restored",
+                "feeds.txt выглядел испорченным (похож на код, а не на список каналов) — "
+                "автоматически восстановлен из резервной копии feeds_backup.txt."
+            )
+            return {"feeds_ok": True, "healed": True}
+
+    record_self_heal_event(
+        "feeds_corrupted_no_backup",
+        "feeds.txt выглядит испорченным, а валидной резервной копии нет — "
+        "нужно вмешательство человека (восстановить файл из истории git)."
+    )
+    return {"feeds_ok": False, "healed": False}
+
+
+# 2) Проверка, что Telegram-токен вообще ещё действителен. Если токен
+# отозван/просрочен, каждый send_to_telegram будет молча проваливаться —
+# лучше явно понять причину сразу, а не гадать по логам отправки.
+def check_telegram_token_health():
+    if not TELEGRAM_TOKEN:
+        return False
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=10)
+        data = resp.json()
+        return bool(data.get("ok"))
+    except Exception:
+        return False
+
+
+TOKEN_ALERT_MIN_GAP_SECONDS = 24 * 3600
+
+
+def check_and_alert_token_health():
+    healthy = check_telegram_token_health()
+    if healthy:
+        return True
+    alert_state = _load_json(ALERT_STATE_FILE, {"last_alert": 0, "last_token_alert": 0})
+    if time.time() - alert_state.get("last_token_alert", 0) < TOKEN_ALERT_MIN_GAP_SECONDS:
+        return False
+    record_self_heal_event(
+        "telegram_token_invalid",
+        "Telegram-токен не прошёл проверку (getMe вернул ошибку) — бот не сможет публиковать, "
+        "пока токен не будет обновлён в секретах репозитория."
+    )
+    send_admin_alert(
+        "🔴 Telegram-токен бота недействителен (getMe вернул ошибку). "
+        "Проверьте TELEGRAM_BOT_TOKEN в секретах репозитория — возможно, токен отозван или истёк."
+    )
+    alert_state["last_token_alert"] = time.time()
+    _save_json(ALERT_STATE_FILE, alert_state)
+    return False
+
+
+# 3) Автономная уборка "осиротевших" закреплённых сообщений — на случай,
+# если по любой причине (сбой git, ручное вмешательство, старый баг) в
+# live_stories.json остались "живые" по счётчику, но фактически устаревшие
+# записи. Открепляем то, что старше LIVE_STORY_MAX_AGE_HOURS, и явно
+# логируем это как самостоятельное действие, а не полагаемся только на
+# то, что при старте нового эфира открепляются прошлые.
+def self_heal_expired_pins():
+    threads = load_live_threads()
+    now = time.time()
+    still_active = []
+    healed_count = 0
+    for thread in threads:
+        if now - thread.get("last_update_ts", 0) > LIVE_STORY_MAX_AGE_HOURS * 3600:
+            msg_id = thread.get("message_id")
+            if msg_id:
+                unpin_message(msg_id)
+                healed_count += 1
+        else:
+            still_active.append(thread)
+    if healed_count:
+        save_live_threads(still_active)
+        record_self_heal_event(
+            "expired_pins_cleaned",
+            f"Откреплено {healed_count} устаревших сообщений ('прямых эфиров' старше "
+            f"{LIVE_STORY_MAX_AGE_HOURS} ч), которые больше не отслеживались активно."
+        )
+    return healed_count
+
+
+def run_self_healing_checks():
+    feeds_status = ensure_feeds_file_healthy()
+    telegram_ok = check_and_alert_token_health()
+    expired_pins_healed = self_heal_expired_pins()
+    return {
+        "feeds_ok": feeds_status["feeds_ok"],
+        "feeds_healed_this_run": feeds_status["healed"],
+        "telegram_ok": telegram_ok,
+        "expired_pins_healed_this_run": expired_pins_healed,
+        "checked_at": datetime.utcnow().isoformat(),
+    }
+
+
 def main():
     print(f"[START] {datetime.now().isoformat()}")
+
+    self_check = run_self_healing_checks()
 
     dt_msk = now_msk()
     day_key = today_key(dt_msk)
@@ -2718,7 +2950,7 @@ def main():
     new_alert_timestamp = check_silence_alert(elapsed_at_start)
 
     def persist_with_status(sent_count=None, note="", **kwargs):
-        status = build_status_snapshot(elapsed_at_start, sent_count=sent_count, note=note)
+        status = build_status_snapshot(elapsed_at_start, sent_count=sent_count, note=note, self_check=self_check)
         persist_state_to_git(
             new_alert_timestamp=new_alert_timestamp,
             new_status=status,
@@ -2867,7 +3099,7 @@ def main():
     new_digest_state = None
 
     slot = due_digest_slot(dt_msk, digest_state.get("slots", []))
-    if slot and (now_ts - digest_state.get("last_sent_ts", 0)) >= MIN_DIGEST_GAP_SECONDS:
+    if slot and (now_ts - digest_state.get("last_sent_ts", 0)) >= MIN_DIGEST_GAP_SECONDS and self_check["feeds_ok"]:
         digest_items = fetch_news()
         digest_items = order_candidates_by_priority(digest_items, load_recent_posts())
         digest_items.sort(key=lambda it: not it.get("urgent"))
@@ -2961,7 +3193,7 @@ def main():
             )
         return
 
-    news = fetch_news()
+    news = fetch_news() if self_check["feeds_ok"] else []
     if not news:
         # ФИКС ("радикально и наверняка"): раньше, если строгий fetch_news()
         # (с требованием фото/видео и фильтром "не новость") не находил
@@ -2973,13 +3205,17 @@ def main():
         # публикации, пробуем СМЯГЧЁННЫЙ повторный проход по тем же
         # источникам — без требования фото/видео и без фильтра "не
         # новость" — и берём оттуда что угодно ещё не опубликованное.
-        if elapsed is not None and elapsed >= GUARANTEED_CADENCE_SECONDS:
+        # Если же сам feeds.txt сейчас нездоров (self_check провалился) —
+        # смягчённый проход тоже пропускаем: нет смысла повторно читать
+        # тот же испорченный/пустой список источников.
+        if self_check["feeds_ok"] and elapsed is not None and elapsed >= GUARANTEED_CADENCE_SECONDS:
             print(f"[INFO] Строгий поиск не нашёл вообще ничего, а с последней публикации "
                   f"прошло {int(elapsed)} сек — пробуем смягчённый поиск (без требования "
                   f"фото/видео, без фильтра «не новость») для гарантии частоты публикаций.")
             news = fetch_news(require_media=False, skip_not_news_filter=True)
         if not news:
-            print("[INFO] No new news.")
+            print("[INFO] No new news." if self_check["feeds_ok"]
+                  else "[WARN] feeds.txt нездоров (self-check) — пропускаем поиск новостей в этом прогоне.")
             if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
                 persist_with_status(
                     note="skip:no_news",
