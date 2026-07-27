@@ -2048,6 +2048,166 @@ def format_market_snapshot(rates, index_data, prev_state):
     return "\n".join(lines).strip()
 
 
+# --- "Гениальная" фича: автоматическая хроника развивающихся историй ---
+# Бот сам находит среди своих же опубликованных постов те, что на самом
+# деле части ОДНОЙ большой истории (Эльбрус, конкретный теракт, серия
+# атак на один город и т.п.) — используя те же именные стемы, что уже
+# применяются для дедупа и "прямого эфира", но здесь не для проверки
+# дублей, а для КЛАСТЕРИЗАЦИИ: строим граф "какие посты связаны общим
+# местом/персоной" и ищем связные компоненты (union-find). Когда кластер
+# набирает достаточно постов, GigaChat пишет из них связную хронику —
+# не пересказ последнего поста, а синтез ВСЕЙ истории в хронологическом
+# порядке, как делает редакция при подготовке разбора, а не бот, гонящий
+# отдельные новости. Публикуется не чаще раза в сутки и никогда дважды
+# для одного и того же набора постов (отслеживаем по "подписи" кластера).
+STORY_TIMELINE_TIME = "19:00"  # МСК
+STORY_TIMELINE_WINDOW_MINUTES = DIGEST_WINDOW_MINUTES
+STORY_TIMELINE_STATE_FILE = "story_timeline_state.json"
+MIN_STORY_TIMELINE_GAP_SECONDS = 20 * 3600
+STORY_TIMELINE_MIN_POSTS = 4          # минимальный размер кластера
+STORY_TIMELINE_LOOKBACK_DAYS = 14     # кластеризуем только недавние посты
+STORY_TIMELINE_MAX_TRACKED_SIGNATURES = 200
+
+
+def due_story_timeline(dt, already_sent_today):
+    if already_sent_today:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, STORY_TIMELINE_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= STORY_TIMELINE_WINDOW_MINUTES
+
+
+def build_entity_clusters(recent_posts, exclude_entities=None, lookback_days=STORY_TIMELINE_LOOKBACK_DAYS):
+    exclude_entities = exclude_entities or set()
+    now = time.time()
+    eligible = [
+        p for p in recent_posts
+        if p.get("message_id") and (not p.get("ts") or now - p["ts"] <= lookback_days * 24 * 3600)
+    ]
+    n = len(eligible)
+    if n == 0:
+        return []
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    entity_sets = [
+        (extract_entity_stems(p.get("headline", "")) | extract_entity_stems(p.get("summary", ""))) - exclude_entities
+        for p in eligible
+    ]
+    for i in range(n):
+        if not entity_sets[i]:
+            continue
+        for j in range(i + 1, n):
+            if entity_sets[i] & entity_sets[j]:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(eligible[i])
+    return [sorted(g, key=lambda p: p.get("ts", 0)) for g in groups.values()]
+
+
+def cluster_signature(cluster):
+    return tuple(sorted(p["message_id"] for p in cluster if p.get("message_id")))
+
+
+def pick_story_timeline_cluster(recent_posts, already_published_signatures, exclude_entities=None,
+                                 min_posts=STORY_TIMELINE_MIN_POSTS):
+    clusters = build_entity_clusters(recent_posts, exclude_entities=exclude_entities)
+    candidates = [c for c in clusters if len(c) >= min_posts]
+    candidates = [c for c in candidates if cluster_signature(c) not in already_published_signatures]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (len(c), c[-1].get("ts", 0)), reverse=True)
+    return candidates[0]
+
+
+def build_story_timeline_via_ai(cluster):
+    token = get_gigachat_token()
+    if not token or len(cluster) < 2:
+        return None
+    try:
+        listing_lines = []
+        for p in cluster:
+            ts = p.get("ts")
+            time_label = datetime.fromtimestamp(ts + MSK_OFFSET.total_seconds()).strftime("%d.%m %H:%M") if ts else "?"
+            listing_lines.append(f"[{time_label}] {p.get('headline', '')} — {p.get('summary', '')[:200]}")
+        listing = "\n".join(listing_lines)
+        prompt = (
+            "Ниже — посты одного новостного Telegram-канала об ОДНОЙ и той же "
+            "развивающейся истории, в хронологическом порядке (метка времени "
+            "дд.мм чч:мм — заголовок — краткое содержание):\n\n" + listing + "\n\n"
+            "Напиши связную хронику этой истории для читателей, которые могли "
+            "пропустить отдельные посты. Формат:\n"
+            "1) Короткий заголовок хроники (до 60 символов, без кавычек).\n"
+            "2) 4-7 хронологических пунктов вида «дд.мм чч:мм — что произошло», "
+            "используя ТОЛЬКО факты из текста выше, без домыслов.\n"
+            "3) Одно заключительное предложение — что известно на данный момент "
+            "и что означает эта история в целом.\n\n"
+            "Ответь СТРОГО в формате:\n"
+            "ЗАГОЛОВОК: <текст>\n"
+            "ХРОНИКА:\n<пункты>\n"
+            "ИТОГ: <текст>"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 700,
+        }
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        title_match = re.search(r"ЗАГОЛОВОК:\s*(.+)", answer)
+        chronicle_match = re.search(r"ХРОНИКА:\s*(.+?)(?=\n\s*ИТОГ:|\Z)", answer, re.S)
+        summary_match = re.search(r"ИТОГ:\s*(.+)", answer)
+        if not (title_match and chronicle_match):
+            return None
+        return {
+            "title": title_match.group(1).strip(),
+            "chronicle": chronicle_match.group(1).strip(),
+            "summary": summary_match.group(1).strip() if summary_match else "",
+        }
+    except Exception as e:
+        print(f"[WARN] build_story_timeline_via_ai error: {e}")
+        return None
+
+
+def format_story_timeline(ai_result, cluster):
+    lines = [f"🧵 <b>Хроника: {html.escape(ai_result['title'])}</b>", ""]
+    chronicle_clean = sanitize_text(ai_result["chronicle"])
+    lines.append(html.escape(chronicle_clean))
+    if ai_result.get("summary"):
+        lines.append("")
+        lines.append(f"💡 {html.escape(sanitize_text(ai_result['summary']))}")
+    lines.append("")
+    links = []
+    for p in cluster:
+        msg_id = p.get("message_id")
+        if msg_id:
+            links.append(f'<a href="https://t.me/{CHANNEL_USERNAME}/{msg_id}">{len(links) + 1}</a>')
+    if links:
+        lines.append("Все посты по теме: " + " · ".join(links))
+    return "\n".join(lines).strip()
+
+
 WEEKLY_RECAP_WEEKDAY = 6
 WEEKLY_RECAP_TIME = "20:00"
 WEEKLY_RECAP_WINDOW_MINUTES = 4
@@ -2318,7 +2478,7 @@ STATE_FILES = [
     DIGEST_STATE_FILE, POLL_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
     SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE, MARKET_STATE_FILE,
-    SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE,
+    SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE, STORY_TIMELINE_STATE_FILE,
 ]
 
 
@@ -2336,7 +2496,7 @@ def _git_show_json(ref_path, default):
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None,
                           new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
-                          new_quiz_state=None, new_market_state=None):
+                          new_quiz_state=None, new_market_state=None, new_story_timeline_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return True
     import subprocess
@@ -2362,6 +2522,8 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
             remote_quiz = _git_show_json(f"origin/main:{QUIZ_STATE_FILE}", {"date": None, "sent": False})
             remote_market = _git_show_json(f"origin/main:{MARKET_STATE_FILE}", {"date": None, "sent": False})
+            remote_story_timeline = _git_show_json(f"origin/main:{STORY_TIMELINE_STATE_FILE}",
+                                                     {"date": None, "sent": False, "signatures": []})
             remote_weekly_recap = _git_show_json(f"origin/main:{WEEKLY_RECAP_STATE_FILE}", {"week_key": None, "sent": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
@@ -2440,6 +2602,23 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_poll = _merge_daily_state(remote_poll, new_poll_state)
             merged_quiz = _merge_daily_state(remote_quiz, new_quiz_state)
             merged_market = _merge_daily_state(remote_market, new_market_state)
+
+            def _merge_story_timeline_state(remote, new):
+                base = _merge_daily_state(remote, new)
+                sig_lists = (remote or {}).get("signatures", []) + (new or {}).get("signatures", [])
+                seen = set()
+                merged_sigs = []
+                for sig in sig_lists:
+                    key = tuple(sig)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged_sigs.append(list(key))
+                base = dict(base or {})
+                base["signatures"] = merged_sigs[-STORY_TIMELINE_MAX_TRACKED_SIGNATURES:]
+                return base
+
+            merged_story_timeline = _merge_story_timeline_state(remote_story_timeline, new_story_timeline_state)
             merged_weekly_recap = _merge_daily_state(remote_weekly_recap, new_weekly_recap_state)
             merged_alert = {
                 "last_alert": max(remote_alert.get("last_alert", 0), new_alert_timestamp or 0)
@@ -2460,6 +2639,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(POLL_STATE_FILE, merged_poll)
             _save_json(QUIZ_STATE_FILE, merged_quiz)
             _save_json(MARKET_STATE_FILE, merged_market)
+            _save_json(STORY_TIMELINE_STATE_FILE, merged_story_timeline)
             _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
@@ -2608,6 +2788,51 @@ def main():
             new_market_state = market_state
             print("[WARN] CBR rates unavailable, skipping market snapshot for today.")
 
+    # --- Хроника развивающихся историй (кластеризация + синтез через ИИ) ---
+    story_timeline_state = _load_json(STORY_TIMELINE_STATE_FILE,
+                                       {"date": None, "sent": False, "last_sent_ts": 0, "signatures": []})
+    if story_timeline_state.get("date") != day_key:
+        story_timeline_state = {
+            "date": day_key, "sent": False,
+            "last_sent_ts": story_timeline_state.get("last_sent_ts", 0),
+            "signatures": story_timeline_state.get("signatures", []),
+        }
+    new_story_timeline_state = None
+    if due_story_timeline(dt_msk, story_timeline_state.get("sent")) and \
+            (now_ts - story_timeline_state.get("last_sent_ts", 0)) >= MIN_STORY_TIMELINE_GAP_SECONDS:
+        recent_posts_for_timeline = load_recent_posts()
+        common_entities_timeline = compute_common_entity_stems(recent_posts_for_timeline)
+        already_published_sigs = {tuple(s) for s in story_timeline_state.get("signatures", [])}
+        cluster = pick_story_timeline_cluster(
+            recent_posts_for_timeline, already_published_sigs, exclude_entities=common_entities_timeline
+        )
+        if cluster:
+            ai_result = build_story_timeline_via_ai(cluster)
+            if ai_result:
+                timeline_text = format_story_timeline(ai_result, cluster)
+                if send_to_telegram(timeline_text):
+                    sig = list(cluster_signature(cluster))
+                    story_timeline_state["sent"] = True
+                    story_timeline_state["last_sent_ts"] = now_ts
+                    story_timeline_state["signatures"] = (
+                        story_timeline_state.get("signatures", []) + [sig]
+                    )[-STORY_TIMELINE_MAX_TRACKED_SIGNATURES:]
+                    new_story_timeline_state = story_timeline_state
+                    print(f"[INFO] Story timeline published: '{ai_result['title']}' "
+                          f"({len(cluster)} постов).")
+                else:
+                    print("[WARN] Story timeline send failed, will retry next eligible run.")
+            else:
+                print("[INFO] Story timeline cluster found but AI synthesis failed, skipping for now.")
+                story_timeline_state["sent"] = True
+                story_timeline_state["last_sent_ts"] = now_ts
+                new_story_timeline_state = story_timeline_state
+        else:
+            print("[INFO] No story cluster big enough for a timeline right now.")
+            story_timeline_state["sent"] = True
+            story_timeline_state["last_sent_ts"] = now_ts
+            new_story_timeline_state = story_timeline_state
+
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
@@ -2707,6 +2932,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
                 )
                 print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
                 return
@@ -2723,7 +2949,7 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
@@ -2731,6 +2957,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
             )
         return
 
@@ -2753,7 +2980,7 @@ def main():
             news = fetch_news(require_media=False, skip_not_news_filter=True)
         if not news:
             print("[INFO] No new news.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
                 persist_with_status(
                     note="skip:no_news",
                     new_digest_state=new_digest_state,
@@ -2761,6 +2988,7 @@ def main():
                     new_weekly_recap_state=new_weekly_recap_state,
                     new_quiz_state=new_quiz_state,
                     new_market_state=new_market_state,
+                    new_story_timeline_state=new_story_timeline_state,
                 )
             return
 
@@ -2779,7 +3007,7 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
@@ -2787,6 +3015,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
                 )
             return
         normal_items = prefer_video(normal_items)
@@ -2811,7 +3040,7 @@ def main():
 
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
@@ -2819,6 +3048,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
             )
         return
 
@@ -2863,6 +3093,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
             )
             print(f"[DONE] Fact update published: {fu['keyword']} {fu['old_value']} → {fu['new_value']}.")
         else:
@@ -2926,6 +3157,7 @@ def main():
                     new_weekly_recap_state=new_weekly_recap_state,
                     new_quiz_state=new_quiz_state,
                     new_market_state=new_market_state,
+                    new_story_timeline_state=new_story_timeline_state,
                 )
                 print(f"[DONE] Live thread updated (message {active_thread['message_id']}): "
                       f"'{chosen['title'][:50]}'")
@@ -3001,6 +3233,7 @@ def main():
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
+                new_story_timeline_state=new_story_timeline_state,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
