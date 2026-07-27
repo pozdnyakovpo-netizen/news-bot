@@ -16,3 +16,4 @@ https://rg.ru/xml/index.xml
 https://lenta.ru/rss
 https://www.gazeta.ru/export/rss/first.xml
 https://www.rt.com/rss/
+Add RSS feeds source list
