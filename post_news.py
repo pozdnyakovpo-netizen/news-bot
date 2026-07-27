@@ -2678,13 +2678,27 @@ def main():
                     recent_words.append(set(chosen["content_words"]))
                     save_recent_title_words(recent_words)
                     new_title_words_list.append(chosen["content_words"])
-                mark_published_now()
+                # ФИКС (найдено при доскональной проверке жалобы "давно нет
+                # новостей"): здесь раньше стояли mark_published_now() и
+                # new_last_publish=time.time() — но editMessageText НИЧЕГО
+                # не публикует в канал: подписчики не видят правку, нет
+                # уведомления. Тем не менее это обнуляло тот же самый
+                # таймер "последняя публикация", который используется (а)
+                # чтобы не постить чаще, чем раз в URGENT_INTERVAL/
+                # PUBLISH_INTERVAL, и (б) для расчёта "здоровья" бота на
+                # дашборде/алертах. Из-за широкого списка URGENT_KEYWORDS
+                # и активного "эфира" (живёт до 12 часов) бот мог правку за
+                # правкой обнулять этот таймер, откладывая любую другую,
+                # по-настоящему новую публикацию ещё на 10 минут каждый
+                # раз — а дашборд при этом показывал "всё ок", маскируя
+                # реальную тишину в канале. Теперь тихая правка НЕ считается
+                # публикацией: таймер и health-статус отражают только то,
+                # что реально появилось в канале.
                 persist_with_status(
                     sent_count=1,
                     note="live_thread_update",
                     new_posted_ids=new_posted_ids,
                     new_title_words_list=new_title_words_list,
-                    new_last_publish=time.time(),
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                     new_weekly_recap_state=new_weekly_recap_state,
