@@ -684,10 +684,21 @@ def append_live_update(thread, item):
 MAX_AI_DEDUPE_CHECKS = 5
 
 
+# ФИКС: раньше сюда передавался recent_posts целиком (до 300 записей) без
+# ограничения — огромный промпт с сотнями пунктов при max_tokens=10 на
+# ответ повышает риск, что GigaChat не сможет корректно сопоставить или
+# ответ обрежется непредсказуемо. Смысловая проверка на практике не
+# требует всей истории — последних записей достаточно, чтобы поймать
+# "то же событие, другими словами", а промпт остаётся компактным и
+# надёжным.
+AI_DEDUP_RECENT_POSTS_LIMIT = 30
+
+
 def check_semantic_duplicate_via_ai(candidate_title, candidate_summary, recent_posts):
     token = get_gigachat_token()
     if not token or not recent_posts:
         return None
+    recent_posts = recent_posts[-AI_DEDUP_RECENT_POSTS_LIMIT:]
     try:
         listing = "\n".join(
             f"{i}. {p.get('headline', '')} — {p.get('summary', '')[:150]}"
@@ -1141,29 +1152,48 @@ def pick_featured_index(items):
 
 
 def pick_non_duplicate(items):
+    # ФИКС (диагностика): раньше два из четырёх шагов отбраковки ("уже
+    # опубликовано" и "дубль по смыслу через recent_titles") не писали
+    # НИЧЕГО в лог — из-за этого в реальном прогоне было видно "дубль по
+    # именному стему" только для 2 из 60 кандидатов, а куда делись
+    # остальные 58 — было совершенно непонятно. Теперь причина отсева
+    # логируется на каждом шаге, плюс в конце — сводка по количеству
+    # причин, чтобы сразу было видно, какой именно фильтр съедает кандидатов.
     posted_now = load_posted()
     recent_now = load_recent_title_words()
     recent_posts_now = load_recent_posts()
     common_entities = compute_common_entity_stems(recent_posts_now)
     ai_checks_used = 0
+    reasons = {"already_posted": 0, "meaning_dup": 0, "entity_dup": 0, "ai_dup": 0}
     for it in items:
+        title_short = it["title"][:50]
         if it["id"] in posted_now or it["title_key"] in posted_now:
+            reasons["already_posted"] += 1
+            print(f"[INFO] '{title_short}' — уже было опубликовано ранее, пропускаем.")
             continue
         cw = set(it.get("content_words") or [])
         if cw and is_duplicate_by_meaning(cw, recent_now):
+            reasons["meaning_dup"] += 1
+            print(f"[INFO] '{title_short}' — дубль по смыслу (пересечение слов с недавними "
+                  f"заголовками), пропускаем.")
             continue
         if is_duplicate_word_or_entity(it["title"], it.get("summary", ""), recent_posts_now,
                                         exclude_entities=common_entities):
-            print(f"[INFO] '{it['title'][:50]}' — дубль по именному стему, пропускаем.")
+            reasons["entity_dup"] += 1
+            print(f"[INFO] '{title_short}' — дубль по именному стему, пропускаем.")
             continue
         if ai_checks_used < MAX_AI_DEDUPE_CHECKS:
             ai_checks_used += 1
             dup_idx = check_semantic_duplicate_via_ai(it["title"], it.get("summary", ""), recent_posts_now)
             if dup_idx is not None:
-                print(f"[INFO] GigaChat считает '{it['title'][:50]}' тем же событием, "
+                reasons["ai_dup"] += 1
+                print(f"[INFO] GigaChat считает '{title_short}' тем же событием, "
                       f"что и недавний пост #{dup_idx} — пропускаем.")
                 continue
         return it
+    print(f"[INFO] pick_non_duplicate: все {len(items)} кандидатов отклонены — "
+          f"уже опубликовано: {reasons['already_posted']}, дубль по смыслу: {reasons['meaning_dup']}, "
+          f"дубль по стему: {reasons['entity_dup']}, дубль по мнению ИИ: {reasons['ai_dup']}.")
     return None
 
 
