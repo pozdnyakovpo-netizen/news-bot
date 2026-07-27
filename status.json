@@ -1,1 +1,1 @@
-{"last_check": "2026-07-27T03:49:54.960526", "seconds_since_last_publish": 288.79964232444763, "healthy": true, "sent_count_last_run": 1, "note": "normal_post", "avg_publish_latency_minutes": 79.0, "median_publish_latency_minutes": 75.9, "speed_samples_count": 200}
+{"last_check": "2026-07-27T05:01:59.003788", "seconds_since_last_publish": 4217.516077756882, "healthy": true, "sent_count_last_run": 5, "note": "digest:08:00", "avg_publish_latency_minutes": 79.0, "median_publish_latency_minutes": 75.9, "speed_samples_count": 200}
