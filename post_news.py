@@ -996,6 +996,113 @@ TELEGRAM_PREVIEW_HEADERS = {
 }
 
 
+# --- "Вселенского масштаба" фича: реальные метрики вовлечённости для
+# продажи канала ---
+# Число подписчиков — самая слабая метрика при оценке канала (легко
+# накрутить, ничего не говорит о реальной активности аудитории).
+# Настоящую ценность показывают ПРОСМОТРЫ постов — а Telegram публикует
+# их прямо на открытой странице предпросмотра канала (t.me/s/<канал>),
+# той же самой, которую бот уже парсит для источников. Дополнительно
+# парсим СВОЙ ЖЕ канал тем же способом, копим историю просмотров по
+# каждому посту и строим из этого профессиональный "Медиакит" — то, что
+# реально смотрит покупатель канала, а не просто "у вас N подписчиков".
+CHANNEL_VIEWS_FILE = "channel_views.json"
+CHANNEL_VIEWS_LIMIT = 500
+
+
+def _parse_view_count(text):
+    if not text:
+        return None
+    t = text.strip().upper().replace(",", ".").replace(" ", "")
+    try:
+        if t.endswith("K"):
+            return int(float(t[:-1]) * 1000)
+        if t.endswith("M"):
+            return int(float(t[:-1]) * 1_000_000)
+        return int(t)
+    except ValueError:
+        return None
+
+
+def fetch_own_channel_views(username=CHANNEL_USERNAME, limit=50):
+    url = f"https://t.me/s/{username}"
+    try:
+        resp = requests.get(url, headers=TELEGRAM_PREVIEW_HEADERS, timeout=FETCH_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[WARN] fetch_own_channel_views failed: {e}")
+        return {}
+    soup = BeautifulSoup(resp.text, "html.parser")
+    messages = soup.select("div.tgme_widget_message")[-limit:]
+    result = {}
+    for msg in messages:
+        post_id = msg.get("data-post")
+        if not post_id:
+            continue
+        views_el = msg.select_one(".tgme_widget_message_views")
+        views = _parse_view_count(views_el.get_text(strip=True)) if views_el else None
+        if views is not None:
+            result[post_id] = views
+    return result
+
+
+def load_channel_views():
+    return _load_json(CHANNEL_VIEWS_FILE, {})
+
+
+def save_channel_views(data):
+    # Храним только последние CHANNEL_VIEWS_LIMIT постов по времени первого
+    # появления, чтобы файл не рос бесконечно.
+    items = sorted(data.items(), key=lambda kv: kv[1].get("first_seen_ts", 0))
+    trimmed = dict(items[-CHANNEL_VIEWS_LIMIT:])
+    _save_json(CHANNEL_VIEWS_FILE, trimmed)
+
+
+def update_channel_views_history():
+    snapshot = fetch_own_channel_views()
+    if not snapshot:
+        return load_channel_views()
+    history = load_channel_views()
+    now = time.time()
+    for post_id, views in snapshot.items():
+        entry = history.get(post_id)
+        if entry is None:
+            history[post_id] = {"views": views, "first_seen_ts": now, "last_seen_ts": now}
+        else:
+            entry["views"] = max(entry.get("views", 0), views)
+            entry["last_seen_ts"] = now
+    save_channel_views(history)
+    return history
+
+
+def compute_engagement_stats(views_history):
+    entries = sorted(views_history.values(), key=lambda e: e.get("first_seen_ts", 0))
+    view_counts = [e["views"] for e in entries if isinstance(e.get("views"), (int, float))]
+    if not view_counts:
+        return {"tracked_posts": 0, "avg_views": None, "median_views": None,
+                "total_views": 0, "trend_pct": None}
+    total = sum(view_counts)
+    avg = total / len(view_counts)
+    sorted_counts = sorted(view_counts)
+    mid = len(sorted_counts) // 2
+    median = sorted_counts[mid] if len(sorted_counts) % 2 else (sorted_counts[mid - 1] + sorted_counts[mid]) / 2
+    trend_pct = None
+    if len(view_counts) >= 20:
+        recent = view_counts[-10:]
+        previous = view_counts[-20:-10]
+        prev_avg = sum(previous) / len(previous)
+        recent_avg = sum(recent) / len(recent)
+        if prev_avg > 0:
+            trend_pct = round((recent_avg - prev_avg) / prev_avg * 100, 1)
+    return {
+        "tracked_posts": len(view_counts),
+        "avg_views": round(avg, 1),
+        "median_views": median,
+        "total_views": total,
+        "trend_pct": trend_pct,
+    }
+
+
 def fetch_telegram_channel(username, limit=20):
     url = f"https://t.me/s/{username}"
     try:
@@ -2326,6 +2433,7 @@ DASHBOARD_FILE = os.path.join(DOCS_DIR, "index.html")
 # .nojekyll — стандартный флаг-файл, который отключает эту обработку:
 # наш дашборд — чистый статический HTML, Jekyll ему не нужен.
 NOJEKYLL_FILE = os.path.join(DOCS_DIR, ".nojekyll")
+MEDIA_KIT_FILE = os.path.join(DOCS_DIR, "media-kit.html")
 
 
 def _svg_sparkline(history, width=640, height=140, pad=24):
@@ -2451,7 +2559,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 <body>
 <div class="wrap">
   <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
-  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a></p>
+  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a></p>
 
   <div class="grid">
     <div class="card">
@@ -2502,6 +2610,142 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 
 
 
+def build_media_kit_html(status, subscriber_history, engagement_stats, self_heal_log, generated_at_msk):
+    status = status or {}
+    current_subs = subscriber_history[-1]["count"] if subscriber_history else None
+    first_subs = subscriber_history[0]["count"] if subscriber_history else None
+    growth_pct = None
+    if current_subs is not None and first_subs and first_subs > 0:
+        growth_pct = round((current_subs - first_subs) / first_subs * 100, 1)
+    sparkline_svg = _svg_sparkline(subscriber_history)
+
+    median_latency = status.get("median_publish_latency_minutes")
+    healthy = status.get("healthy")
+    uptime_label = "Стабильно, без длительных простоев" if healthy else "Были перебои — см. дашборд"
+
+    avg_views = engagement_stats.get("avg_views")
+    median_views = engagement_stats.get("median_views")
+    total_views = engagement_stats.get("total_views") or 0
+    tracked_posts = engagement_stats.get("tracked_posts") or 0
+    trend_pct = engagement_stats.get("trend_pct")
+    trend_label = (
+        f"{'▲' if trend_pct >= 0 else '▼'} {abs(trend_pct):.1f}% к предыдущим 10 постам"
+        if trend_pct is not None else "накапливаем историю"
+    )
+
+    features = [
+        "Публикация из 20+ проверенных источников с приоритетом официальных агентств (ТАСС)",
+        "Многоуровневый дедуп: по смыслу, по именным сущностям и через ИИ-сверку — не дублирует уже освещённые события",
+        "Автоматическое обнаружение изменившихся фактов (число погибших/пострадавших) — публикует явные уточнения, а не тихо теряет обновления",
+        "«Прямые эфиры» — развивающиеся истории обновляются в одном закреплённом посте, а не спамят лентой",
+        "Автоматическая хроника: бот сам находит связанные посты за 2 недели и синтезирует связный разбор истории через ИИ",
+        "Ежедневный опрос, викторина по реальным новостям канала и еженедельный дайджест для вовлечения аудитории",
+        "Утренняя сводка по рынкам (курсы ЦБ, индекс МосБиржи) — не только новости, но и деловая ценность",
+        "Публичный live-дашборд статистики и автономный слой самодиагностики: бот сам обнаруживает и чинит сбои (отозванный токен, испорченные конфиги, зависшие процессы)",
+        "Гарантированная частота публикаций (аварийный режим не даёт каналу замолчать надолго)",
+    ]
+    features_html = "".join(f"<li>{html.escape(f)}</li>" for f in features)
+
+    self_heal_count = len(self_heal_log or [])
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — медиакит</title>
+<style>
+  :root {{
+    --bg: #0b0f14; --card: #151b23; --border: #2a323d;
+    --text: #eef2f6; --muted: #93a0ad; --accent: #f0b429; --accent2: #4fd1c5;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 48px 20px 72px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  .wrap {{ max-width: 920px; margin: 0 auto; }}
+  .eyebrow {{ color: var(--accent); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.8rem; font-weight: 600; }}
+  h1 {{ font-size: 2.2rem; margin: 8px 0 4px; }}
+  .subtitle {{ color: var(--muted); margin: 0 0 36px; font-size: 1.05rem; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 28px; }}
+  .stat-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }}
+  .stat-card .label {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .stat-card .value {{ font-size: 1.9rem; font-weight: 700; margin-top: 8px; color: var(--accent2); }}
+  .stat-card .sub {{ color: var(--muted); font-size: 0.85rem; margin-top: 4px; }}
+  .section {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px 26px; margin-bottom: 20px; }}
+  .section h2 {{ font-size: 1.1rem; margin: 0 0 14px; color: var(--accent); }}
+  .sparkline {{ width: 100%; height: auto; margin-top: 6px; }}
+  .spark-label {{ fill: var(--muted); font-size: 11px; }}
+  ul.features {{ list-style: none; padding: 0; margin: 0; }}
+  ul.features li {{ padding: 10px 0 10px 28px; border-bottom: 1px solid var(--border); position: relative; font-size: 0.95rem; }}
+  ul.features li:last-child {{ border-bottom: none; }}
+  ul.features li::before {{ content: "✓"; position: absolute; left: 0; color: var(--accent2); font-weight: 700; }}
+  footer {{ color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }}
+  a {{ color: var(--accent2); }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">Медиакит канала</div>
+  <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
+  <p class="subtitle">Автоматизированный новостной канал полного цикла — от сбора до аналитики.
+  <a href="{html.escape(CHANNEL_LINK)}">Открыть канал</a> ·
+  <a href="index.html">Живой дашборд</a></p>
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">Подписчиков</div>
+      <div class="value">{current_subs if current_subs is not None else "—"}</div>
+      <div class="sub">{f"рост {growth_pct:+.1f}% за период наблюдения" if growth_pct is not None else "накапливаем историю"}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Просмотров на пост (медиана)</div>
+      <div class="value">{median_views if median_views is not None else "—"}</div>
+      <div class="sub">{trend_label}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Всего просмотров отслежено</div>
+      <div class="value">{total_views:,}</div>
+      <div class="sub">по {tracked_posts} последним постам</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Скорость публикации</div>
+      <div class="value">{f"{median_latency:.0f} мин" if median_latency is not None else "—"}</div>
+      <div class="sub">от появления новости у источника</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Рост аудитории</h2>
+    {sparkline_svg or '<p style="color:var(--muted)">Накапливаем историю — график появится через несколько дней</p>'}
+  </div>
+
+  <div class="section">
+    <h2>Надёжность инфраструктуры</h2>
+    <p style="margin:0 0 6px">{uptime_label}</p>
+    <p style="margin:0; color:var(--muted); font-size:0.9rem">
+      Автономная система самодиагностики выполнила {self_heal_count} автоматических
+      исправлений без вмешательства человека — полный журнал доступен на
+      <a href="index.html">дашборде</a>.
+    </p>
+  </div>
+
+  <div class="section">
+    <h2>Технологический стек и конкурентные преимущества</h2>
+    <ul class="features">{features_html}</ul>
+  </div>
+
+  <footer>
+    Страница формируется автоматически ботом на основе собственных данных канала ·
+    последнее обновление: {html.escape(generated_at_msk)} мск<br>
+    Это информационная сводка, а не формальная оценка стоимости актива.
+  </footer>
+</div>
+</body>
+</html>"""
+
+
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
@@ -2509,6 +2753,7 @@ STATE_FILES = [
     SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE, MARKET_STATE_FILE,
     SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE, STORY_TIMELINE_STATE_FILE,
     FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
+    MEDIA_KIT_FILE, CHANNEL_VIEWS_FILE,
 ]
 
 
@@ -2560,6 +2805,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_speed_stats = _git_show_json(f"origin/main:{SPEED_STATS_FILE}", [])
             remote_live_threads = _git_show_json(f"origin/main:{LIVE_STORIES_FILE}", [])
             remote_subscriber_history = _git_show_json(f"origin/main:{SUBSCRIBER_HISTORY_FILE}", [])
+            remote_channel_views = _git_show_json(f"origin/main:{CHANNEL_VIEWS_FILE}", {})
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -2669,6 +2915,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 with open(FEEDS_BACKUP_FILE, "r", encoding="utf-8", errors="ignore") as f:
                     local_feeds_backup_content = f.read()
             local_self_heal_log = load_self_heal_log()
+            local_channel_views = load_channel_views()
 
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
             if reset.returncode != 0:
@@ -2706,6 +2953,22 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_subscriber_history = merge_subscriber_history(remote_subscriber_history, local_subscriber_history)
             save_subscriber_history(merged_subscriber_history)
 
+            merged_channel_views = dict(remote_channel_views or {})
+            for post_id, entry in (local_channel_views or {}).items():
+                existing = merged_channel_views.get(post_id)
+                if existing is None:
+                    merged_channel_views[post_id] = entry
+                else:
+                    existing["views"] = max(existing.get("views", 0), entry.get("views", 0))
+                    existing["first_seen_ts"] = min(
+                        existing.get("first_seen_ts", entry.get("first_seen_ts", 0)),
+                        entry.get("first_seen_ts", existing.get("first_seen_ts", 0)),
+                    )
+                    existing["last_seen_ts"] = max(
+                        existing.get("last_seen_ts", 0), entry.get("last_seen_ts", 0)
+                    )
+            save_channel_views(merged_channel_views)
+
             # Дашборд генерируется из уже смёрженных данных (та же логика,
             # что видит статус-снапшот) — так публичная страница не может
             # разъехаться с тем, что реально записано в state-файлах.
@@ -2723,6 +2986,16 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 )
                 with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
                     f.write(dashboard_html)
+
+                media_kit_html = build_media_kit_html(
+                    status=merged_status,
+                    subscriber_history=merged_subscriber_history,
+                    engagement_stats=compute_engagement_stats(merged_channel_views),
+                    self_heal_log=merged_self_heal_log,
+                    generated_at_msk=now_msk().strftime("%d.%m.%Y %H:%M"),
+                )
+                with open(MEDIA_KIT_FILE, "w", encoding="utf-8") as f:
+                    f.write(media_kit_html)
             except Exception as e:
                 print(f"[WARN] build_dashboard_html error: {e}")
 
@@ -3064,6 +3337,8 @@ def main():
             story_timeline_state["sent"] = True
             story_timeline_state["last_sent_ts"] = now_ts
             new_story_timeline_state = story_timeline_state
+
+    update_channel_views_history()
 
     count = get_subscriber_count()
     update_channel_description(count)
