@@ -463,7 +463,19 @@ def extract_entity_stems(text):
     return stems
 
 
-def compute_common_entity_stems(recent_posts, min_count=5, max_fraction=0.15):
+# ФИКС (найдено при разборе жалобы "давно нет новостей" — реальный кейс:
+# два парафраза одной новости "Отключение электроэнергии в Севастополе..."
+# с ИДЕНТИЧНЫМИ именными стемами (алуште/севаст/крыма/...) не были
+# признаны дублем и оба ушли в канал отдельными постами, а "прямой эфир"
+# не смог их связать). Причина: min_count=5 / max_fraction=0.15 — слишком
+# низкий порог для канала, где много новостей и так крутится вокруг
+# Крыма/СВО/т.п. — специфичные для КОНКРЕТНОГО события имена (Севастополь,
+# Крым) успевают набрать 5 упоминаний за счёт совершенно других историй и
+# начинают ошибочно считаться "фоновым шумом", из-за чего пропадает сама
+# возможность связать парафразы одной истории. Подняли оба порога — теперь
+# исключаются только действительно вездесущие имена (Трамп и т.п.), а не
+# любое достаточно популярное направление новостей.
+def compute_common_entity_stems(recent_posts, min_count=10, max_fraction=0.35):
     if not recent_posts:
         return set()
     counter = {}
@@ -1576,6 +1588,33 @@ def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
     }
 
 
+# ФИКС (найдено при разборе жалобы "новостей нет очень давно"): status.json
+# (и публичный дашборд, который из него строится) раньше обновлялся ТОЛЬКО
+# когда что-то реально произошло — новая публикация, опрос, квиз, дайджест
+# или сводка рынков. Если ни одно из этого не сработало (самый частый
+# случай — бот просто не нашёл неопубликованную новость), main() вообще не
+# вызывал persist_with_status, и status.json застревал на данных из
+# прошлого — из-за этого "Последняя публикация" на дашборде могла
+# показывать одно и то же значение часами, создавая ложное впечатление,
+# что бот молчит, хотя он исправно пытался каждые 5 минут. Теперь дашборд
+# принудительно обновляется хотя бы раз в STATUS_REFRESH_MAX_AGE_SECONDS,
+# даже если больше ничего не изменилось — коммит в git при этом всё равно
+# не чаще, чем раз в это окно (не при каждом из ~288 прогонов в день).
+STATUS_REFRESH_MAX_AGE_SECONDS = 30 * 60
+
+
+def status_is_stale(max_age_seconds=STATUS_REFRESH_MAX_AGE_SECONDS):
+    status = _load_json(STATUS_FILE, {})
+    last_check = status.get("last_check")
+    if not last_check:
+        return True
+    try:
+        last_check_ts = datetime.fromisoformat(last_check).timestamp()
+    except Exception:
+        return True
+    return (time.time() - last_check_ts) >= max_age_seconds
+
+
 def today_key(dt):
     return dt.strftime("%Y-%m-%d")
 
@@ -2531,7 +2570,7 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
@@ -2545,7 +2584,7 @@ def main():
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
             persist_with_status(
                 note="skip:no_news",
                 new_digest_state=new_digest_state,
@@ -2571,7 +2610,7 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
@@ -2597,7 +2636,7 @@ def main():
 
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or status_is_stale():
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
@@ -2688,8 +2727,21 @@ def main():
             if latency is not None:
                 save_speed_stats(load_speed_stats() + [{"latency_seconds": latency, "ts": time.time()}])
             if item.get("urgent") and isinstance(ok, int):
+                # ФИКС: раньше каждая новая "срочная" новость закреплялась
+                # (pin_message), но НИКОГДА не открепляла предыдущую — со
+                # временем в канале накапливалось несколько одновременно
+                # закреплённых сообщений (видно на реальном кейсе:
+                # несколько раз подряд "Факты Дня закрепил(а) ..."). Перед
+                # тем как закрепить новый эфир, открепляем все ещё
+                # "живые" (не остывшие) прошлые эфиры — в любой момент
+                # закреплённым остаётся только самый свежий.
+                previous_threads = load_live_threads()
+                for prev_thread in previous_threads:
+                    prev_msg_id = prev_thread.get("message_id")
+                    if prev_msg_id and prev_msg_id != ok:
+                        unpin_message(prev_msg_id)
                 new_thread = start_live_thread(item, ok)
-                save_live_threads(load_live_threads() + [new_thread])
+                save_live_threads(previous_threads + [new_thread])
                 pin_message(ok)
                 print(f"[INFO] Started new live thread (message {ok}).")
             sent_count += 1
