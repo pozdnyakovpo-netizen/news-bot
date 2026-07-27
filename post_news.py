@@ -2559,6 +2559,15 @@ RSS_FEED_FILE = os.path.join(DOCS_DIR, "rss.xml")
 CORRECTIONS_LOG_FILE = "corrections_log.json"
 CORRECTIONS_PAGE_FILE = os.path.join(DOCS_DIR, "corrections.html")
 EDITORIAL_POLICY_PAGE_FILE = os.path.join(DOCS_DIR, "o-redakcii.html")
+ENTITY_INDEX_FILE = "entity_index.json"
+DOSSIERS_INDEX_FILE = os.path.join(DOCS_DIR, "dossiers.html")
+DOSSIERS_DIR = os.path.join(DOCS_DIR, "dossiers")
+MIN_MENTIONS_FOR_DOSSIER = 3
+MAX_DOSSIER_PROFILE_UPDATES_PER_RUN = 2
+DOSSIER_TIME = "21:30"  # МСК
+DOSSIER_WINDOW_MINUTES = 4
+DOSSIER_STATE_FILE = "dossier_schedule_state.json"
+MIN_DOSSIER_GAP_SECONDS = 20 * 3600
 CORRECTIONS_LOG_LIMIT = 300
 
 
@@ -2685,7 +2694,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 <body>
 <div class="wrap">
   <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
-  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a> · <a href="corrections.html">архив уточнений</a> · <a href="o-redakcii.html">редполитика</a> · <a href="rss.xml">RSS</a></p>
+  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a> · <a href="corrections.html">архив уточнений</a> · <a href="o-redakcii.html">редполитика</a> · <a href="dossiers.html">база знаний</a> · <a href="rss.xml">RSS</a></p>
 
   <div class="grid">
     <div class="card">
@@ -3052,6 +3061,234 @@ def build_editorial_policy_page(generated_at_msk):
 </html>"""
 
 
+# --- "То, за что ценят федеральные каналы": автоматическая база знаний
+# / система досье по повторяющимся персонам, местам и организациям ---
+# Обычный агрегатор публикует новости и забывает их. Серьёзное издание
+# накапливает СМЫСЛ: у Bloomberg/Reuters есть постоянные "профили" тем и
+# персон, куда стекаются все упоминания. Бот строит это сам: проходит по
+# всей своей истории постов, находит именные сущности (те же стемы, что
+# уже используются для дедупа и кластеризации историй), но теперь не
+# просто исключает совпадения — а СОБИРАЕТ каждое упоминание в единое
+# досье, и раз в сутки просит GigaChat синтезировать из разрозненных
+# фактов связный профиль: кто/что это, какая роль в описываемых
+# событиях, как менялась история со временем. Получается растущая со
+# временем энциклопедия — то, что превращает поток новостей в
+# структурированное знание, а не просто ленту.
+def extract_entity_mentions_with_names(text):
+    # То же самое, что extract_entity_stems, но сохраняет ИСХОДНОЕ слово
+    # (с оригинальным регистром) для каждого стема — нужно для красивого
+    # отображения имени в досье, а не обрубленного 6-буквенного стема.
+    if not text:
+        return {}
+    words = re.findall(r'[А-ЯЁ][а-яё]+', text)
+    result = {}
+    for w in words:
+        wl = w.lower()
+        if len(wl) <= 3 or wl in TITLE_STOPWORDS:
+            continue
+        stem = wl[:6] if len(wl) > 6 else wl
+        if stem in COMMON_ENTITY_STOPWORD_STEMS:
+            continue
+        result.setdefault(stem, w)
+    return result
+
+
+def load_entity_index():
+    return _load_json(ENTITY_INDEX_FILE, {})
+
+
+def save_entity_index(index):
+    _save_json(ENTITY_INDEX_FILE, index)
+
+
+def build_entity_index(recent_posts, exclude_entities=None):
+    exclude_entities = exclude_entities or set()
+    index = {}
+    for post in recent_posts:
+        msg_id = post.get("message_id")
+        if not msg_id:
+            continue
+        mentions = extract_entity_mentions_with_names(post.get("headline", "") or post.get("summary", ""))
+        mentions.update(extract_entity_mentions_with_names(post.get("summary", "")))
+        for stem, display_name in mentions.items():
+            if stem in exclude_entities:
+                continue
+            entry = index.setdefault(stem, {"display_name": display_name, "posts": []})
+            if not any(p.get("message_id") == msg_id for p in entry["posts"]):
+                entry["posts"].append({
+                    "message_id": msg_id,
+                    "headline": post.get("headline", ""),
+                    "ts": post.get("ts", 0),
+                })
+    for entry in index.values():
+        entry["posts"].sort(key=lambda p: p.get("ts", 0))
+    return index
+
+
+def merge_entity_index(remote_index, local_index):
+    merged = {}
+    for stem in set(remote_index) | set(local_index):
+        remote_entry = remote_index.get(stem, {})
+        local_entry = local_index.get(stem, {})
+        posts_by_id = {}
+        for p in remote_entry.get("posts", []) + local_entry.get("posts", []):
+            if p.get("message_id"):
+                posts_by_id[p["message_id"]] = p
+        posts = sorted(posts_by_id.values(), key=lambda p: p.get("ts", 0))
+        # Профиль сохраняем от того, кто обновлялся позже.
+        profile = None
+        profile_updated_ts = 0
+        for entry in (remote_entry, local_entry):
+            if entry.get("profile") and entry.get("profile_updated_ts", 0) >= profile_updated_ts:
+                profile = entry["profile"]
+                profile_updated_ts = entry.get("profile_updated_ts", 0)
+        merged[stem] = {
+            "display_name": local_entry.get("display_name") or remote_entry.get("display_name") or stem,
+            "posts": posts,
+            "profile": profile,
+            "profile_updated_ts": profile_updated_ts,
+        }
+    return merged
+
+
+def build_entity_profile_via_ai(display_name, posts):
+    token = get_gigachat_token()
+    if not token or len(posts) < MIN_MENTIONS_FOR_DOSSIER:
+        return None
+    try:
+        listing = "\n".join(
+            f"- {html.unescape(p.get('headline', ''))}" for p in posts[-30:]
+        )
+        prompt = (
+            f"Ниже — заголовки постов новостного канала, где упоминается "
+            f"«{display_name}», в хронологическом порядке:\n\n{listing}\n\n"
+            "Напиши короткий нейтральный профиль (3-5 предложений): кто или "
+            "что это, в каком контексте фигурирует в этих новостях, как "
+            "развивалась связанная с этим история во времени. Используй "
+            "ТОЛЬКО факты из заголовков выше, ничего не домысливай сверх "
+            "них. Без оценочных суждений. Ответь только текстом профиля, "
+            "без заголовков и пояснений."
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 350,
+        }
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[WARN] build_entity_profile_via_ai error: {e}")
+        return None
+
+
+def _entity_slug(stem):
+    return re.sub(r'[^a-z0-9а-яё]', '', stem.lower()) or "x"
+
+
+def build_dossiers_index_page(entity_index, generated_at_msk):
+    notable = [
+        (stem, e) for stem, e in entity_index.items()
+        if len(e.get("posts", [])) >= MIN_MENTIONS_FOR_DOSSIER
+    ]
+    notable.sort(key=lambda kv: len(kv[1]["posts"]), reverse=True)
+    rows = "".join(
+        f'<li><a href="dossiers/{_entity_slug(stem)}.html">{html.escape(e["display_name"])}</a>'
+        f' <span style="color:#93a0ad">— {len(e["posts"])} упоминаний</span></li>'
+        for stem, e in notable[:100]
+    ) if notable else '<li style="color:#93a0ad">Пока накапливаем историю — досье появятся, когда персона/место упомянутся не менее трёх раз.</li>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — база знаний</title>
+<style>
+  body {{ margin:0; padding:40px 20px 64px; background:#0b0f14; color:#eef2f6;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  .wrap {{ max-width:820px; margin:0 auto; }}
+  h1 {{ font-size:1.6rem; }}
+  p.subtitle {{ color:#93a0ad; }}
+  ul {{ list-style:none; padding:0; }}
+  li {{ padding:10px 0; border-bottom:1px solid #2a323d; }}
+  a {{ color:#4fd1c5; text-decoration:none; font-weight:600; }}
+  a:hover {{ text-decoration:underline; }}
+  footer {{ color:#93a0ad; font-size:0.8rem; margin-top:32px; text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🗂 База знаний</h1>
+  <p class="subtitle">Автоматически собранные досье по персонам, местам и организациям,
+  которые повторяются в новостях канала. · <a href="../index.html" style="font-weight:400">← Дашборд</a></p>
+  <ul>{rows}</ul>
+  <footer>Формируется автоматически · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
+def build_entity_page(stem, entry, generated_at_msk):
+    display_name = entry.get("display_name", stem)
+    profile = entry.get("profile")
+    posts = entry.get("posts", [])
+    profile_html = (
+        f'<p style="font-size:1.05rem; line-height:1.6">{html.escape(profile)}</p>'
+        if profile else '<p style="color:#93a0ad">Профиль появится, когда накопится достаточно упоминаний.</p>'
+    )
+    mentions_html = "".join(
+        f'<li>{html.escape(datetime.fromtimestamp(p["ts"]).strftime("%d.%m.%Y %H:%M")) if p.get("ts") else ""} — '
+        f'<a href="https://t.me/{CHANNEL_USERNAME}/{p["message_id"]}">{html.escape(p.get("headline", ""))}</a></li>'
+        for p in reversed(posts)
+    )
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(display_name)} — досье — {html.escape(CHANNEL_USERNAME)}</title>
+<style>
+  body {{ margin:0; padding:40px 20px 64px; background:#0b0f14; color:#eef2f6;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  .wrap {{ max-width:760px; margin:0 auto; }}
+  h1 {{ font-size:1.7rem; }}
+  p.subtitle {{ color:#93a0ad; }}
+  h2 {{ font-size:1rem; color:#f0b429; margin-top:28px; }}
+  ul {{ list-style:none; padding:0; }}
+  li {{ padding:8px 0; border-bottom:1px solid #2a323d; font-size:0.92rem; }}
+  a {{ color:#4fd1c5; }}
+  footer {{ color:#93a0ad; font-size:0.8rem; margin-top:32px; text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📇 {html.escape(display_name)}</h1>
+  <p class="subtitle"><a href="../dossiers.html">← База знаний</a></p>
+  {profile_html}
+  <h2>Все упоминания ({len(posts)})</h2>
+  <ul>{mentions_html}</ul>
+  <footer>Формируется автоматически · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
+def due_dossier_update(dt, already_sent_today):
+    if already_sent_today:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, DOSSIER_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= DOSSIER_WINDOW_MINUTES
+
+
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
@@ -3061,6 +3298,7 @@ STATE_FILES = [
     FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
     MEDIA_KIT_FILE, CHANNEL_VIEWS_FILE,
     RSS_FEED_FILE, CORRECTIONS_LOG_FILE, CORRECTIONS_PAGE_FILE, EDITORIAL_POLICY_PAGE_FILE,
+    ENTITY_INDEX_FILE, DOSSIERS_INDEX_FILE, DOSSIER_STATE_FILE,
 ]
 
 
@@ -3078,7 +3316,8 @@ def _git_show_json(ref_path, default):
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None,
                           new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
-                          new_quiz_state=None, new_market_state=None, new_story_timeline_state=None):
+                          new_quiz_state=None, new_market_state=None, new_story_timeline_state=None,
+                          new_dossier_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return True
     import subprocess
@@ -3113,6 +3352,8 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_live_threads = _git_show_json(f"origin/main:{LIVE_STORIES_FILE}", [])
             remote_subscriber_history = _git_show_json(f"origin/main:{SUBSCRIBER_HISTORY_FILE}", [])
             remote_channel_views = _git_show_json(f"origin/main:{CHANNEL_VIEWS_FILE}", {})
+            remote_entity_index = _git_show_json(f"origin/main:{ENTITY_INDEX_FILE}", {})
+            remote_dossier_state = _git_show_json(f"origin/main:{DOSSIER_STATE_FILE}", {"date": None, "sent": False})
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -3185,6 +3426,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_poll = _merge_daily_state(remote_poll, new_poll_state)
             merged_quiz = _merge_daily_state(remote_quiz, new_quiz_state)
             merged_market = _merge_daily_state(remote_market, new_market_state)
+            merged_dossier_state = _merge_daily_state(remote_dossier_state, new_dossier_state)
 
             def _merge_story_timeline_state(remote, new):
                 base = _merge_daily_state(remote, new)
@@ -3224,6 +3466,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             local_self_heal_log = load_self_heal_log()
             local_corrections_log = load_corrections_log()
             local_channel_views = load_channel_views()
+            local_entity_index = load_entity_index()
 
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
             if reset.returncode != 0:
@@ -3252,6 +3495,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(POLL_STATE_FILE, merged_poll)
             _save_json(QUIZ_STATE_FILE, merged_quiz)
             _save_json(MARKET_STATE_FILE, merged_market)
+            _save_json(DOSSIER_STATE_FILE, merged_dossier_state)
             _save_json(STORY_TIMELINE_STATE_FILE, merged_story_timeline)
             _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
             _save_json(ALERT_STATE_FILE, merged_alert)
@@ -3279,6 +3523,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                         existing.get("last_seen_ts", 0), entry.get("last_seen_ts", 0)
                     )
             save_channel_views(merged_channel_views)
+
+            merged_entity_index = merge_entity_index(remote_entity_index, local_entity_index)
+            save_entity_index(merged_entity_index)
 
             # Дашборд генерируется из уже смёрженных данных (та же логика,
             # что видит статус-снапшот) — так публичная страница не может
@@ -3315,10 +3562,26 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                     f.write(build_corrections_page(merged_corrections_log, generated_label))
                 with open(EDITORIAL_POLICY_PAGE_FILE, "w", encoding="utf-8") as f:
                     f.write(build_editorial_policy_page(generated_label))
+
+                os.makedirs(DOSSIERS_DIR, exist_ok=True)
+                with open(DOSSIERS_INDEX_FILE, "w", encoding="utf-8") as f:
+                    f.write(build_dossiers_index_page(merged_entity_index, generated_label))
+                for stem, entry in merged_entity_index.items():
+                    if len(entry.get("posts", [])) < MIN_MENTIONS_FOR_DOSSIER:
+                        continue
+                    entity_page_path = os.path.join(DOSSIERS_DIR, f"{_entity_slug(stem)}.html")
+                    with open(entity_page_path, "w", encoding="utf-8") as f:
+                        f.write(build_entity_page(stem, entry, generated_label))
             except Exception as e:
                 print(f"[WARN] build_dashboard_html error: {e}")
 
-            subprocess.run(["git", "add", *STATE_FILES], check=False)
+            # ФИКС: досье по сущностям создают файлы с ЗАРАНЕЕ НЕИЗВЕСТНЫМИ
+            # именами (docs/dossiers/<slug>.html — один на каждую
+            # обнаруженную персону/место) — их нельзя перечислить заранее
+            # в STATE_FILES. Добавляем всю папку docs целиком в git add,
+            # чтобы новые файлы досье коммитились наравне со всем
+            # остальным контентом сайта.
+            subprocess.run(["git", "add", *STATE_FILES, DOCS_DIR], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
             if diff.returncode == 0:
                 print("[INFO] State files unchanged, nothing to commit.")
@@ -3657,6 +3920,46 @@ def main():
             story_timeline_state["last_sent_ts"] = now_ts
             new_story_timeline_state = story_timeline_state
 
+    # --- База знаний: сбор упоминаний сущностей + синтез досье через ИИ ---
+    dossier_state = _load_json(DOSSIER_STATE_FILE, {"date": None, "sent": False, "last_sent_ts": 0})
+    if dossier_state.get("date") != day_key:
+        dossier_state = {"date": day_key, "sent": False, "last_sent_ts": dossier_state.get("last_sent_ts", 0)}
+    new_dossier_state = None
+    if due_dossier_update(dt_msk, dossier_state.get("sent")) and \
+            (now_ts - dossier_state.get("last_sent_ts", 0)) >= MIN_DOSSIER_GAP_SECONDS:
+        recent_posts_for_entities = load_recent_posts()
+        common_entities_dossier = compute_common_entity_stems(recent_posts_for_entities)
+        fresh_index = build_entity_index(recent_posts_for_entities, exclude_entities=common_entities_dossier)
+        working_index = merge_entity_index(load_entity_index(), fresh_index)
+
+        candidates = []
+        for stem, entry in working_index.items():
+            posts = entry.get("posts", [])
+            if len(posts) < MIN_MENTIONS_FOR_DOSSIER:
+                continue
+            last_mention_ts = max((p.get("ts", 0) for p in posts), default=0)
+            if not entry.get("profile") or last_mention_ts > entry.get("profile_updated_ts", 0):
+                candidates.append((stem, entry, len(posts)))
+        candidates.sort(key=lambda c: c[2], reverse=True)
+
+        updates_done = 0
+        for stem, entry, _ in candidates:
+            if updates_done >= MAX_DOSSIER_PROFILE_UPDATES_PER_RUN:
+                break
+            profile = build_entity_profile_via_ai(entry["display_name"], entry["posts"])
+            if profile:
+                entry["profile"] = profile
+                entry["profile_updated_ts"] = time.time()
+                updates_done += 1
+                print(f"[INFO] Dossier profile updated for '{entry['display_name']}'.")
+
+        save_entity_index(working_index)
+        dossier_state["sent"] = True
+        dossier_state["last_sent_ts"] = now_ts
+        new_dossier_state = dossier_state
+        print(f"[INFO] Dossier update pass done: {updates_done} profile(s) refreshed, "
+              f"{len(candidates)} candidate(s) found.")
+
     update_channel_views_history()
 
     count = get_subscriber_count()
@@ -3759,6 +4062,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
                 )
                 print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
                 return
@@ -3775,7 +4079,7 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or new_dossier_state or status_is_stale():
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
@@ -3784,6 +4088,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
             )
         return
 
@@ -3810,7 +4115,7 @@ def main():
         if not news:
             print("[INFO] No new news." if self_check["feeds_ok"]
                   else "[WARN] feeds.txt нездоров (self-check) — пропускаем поиск новостей в этом прогоне.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or new_dossier_state or status_is_stale():
                 persist_with_status(
                     note="skip:no_news",
                     new_digest_state=new_digest_state,
@@ -3819,6 +4124,7 @@ def main():
                     new_quiz_state=new_quiz_state,
                     new_market_state=new_market_state,
                     new_story_timeline_state=new_story_timeline_state,
+                    new_dossier_state=new_dossier_state,
                 )
             return
 
@@ -3837,7 +4143,7 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or new_dossier_state or status_is_stale():
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
@@ -3846,6 +4152,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
                 )
             return
         normal_items = prefer_video(normal_items)
@@ -3870,7 +4177,7 @@ def main():
 
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or status_is_stale():
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state or new_story_timeline_state or new_dossier_state or status_is_stale():
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
@@ -3879,6 +4186,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
             )
         return
 
@@ -3929,6 +4237,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
             )
             print(f"[DONE] Fact update published: {fu['keyword']} {fu['old_value']} → {fu['new_value']}.")
         else:
@@ -3993,6 +4302,7 @@ def main():
                     new_quiz_state=new_quiz_state,
                     new_market_state=new_market_state,
                     new_story_timeline_state=new_story_timeline_state,
+                    new_dossier_state=new_dossier_state,
                 )
                 print(f"[DONE] Live thread updated (message {active_thread['message_id']}): "
                       f"'{chosen['title'][:50]}'")
@@ -4069,6 +4379,7 @@ def main():
                 new_quiz_state=new_quiz_state,
                 new_market_state=new_market_state,
                 new_story_timeline_state=new_story_timeline_state,
+                new_dossier_state=new_dossier_state,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
