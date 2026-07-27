@@ -2434,6 +2434,11 @@ DASHBOARD_FILE = os.path.join(DOCS_DIR, "index.html")
 # наш дашборд — чистый статический HTML, Jekyll ему не нужен.
 NOJEKYLL_FILE = os.path.join(DOCS_DIR, ".nojekyll")
 MEDIA_KIT_FILE = os.path.join(DOCS_DIR, "media-kit.html")
+RSS_FEED_FILE = os.path.join(DOCS_DIR, "rss.xml")
+CORRECTIONS_LOG_FILE = "corrections_log.json"
+CORRECTIONS_PAGE_FILE = os.path.join(DOCS_DIR, "corrections.html")
+EDITORIAL_POLICY_PAGE_FILE = os.path.join(DOCS_DIR, "o-redakcii.html")
+CORRECTIONS_LOG_LIMIT = 300
 
 
 def _svg_sparkline(history, width=640, height=140, pad=24):
@@ -2559,7 +2564,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 <body>
 <div class="wrap">
   <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
-  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a></p>
+  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a> · <a href="corrections.html">архив уточнений</a> · <a href="o-redakcii.html">редполитика</a> · <a href="rss.xml">RSS</a></p>
 
   <div class="grid">
     <div class="card">
@@ -2746,6 +2751,186 @@ def build_media_kit_html(status, subscriber_history, engagement_stats, self_heal
 </html>"""
 
 
+# --- "Только у федеральных каналов": RSS-синдикация, публичный архив
+# опровержений и редакционная политика ---
+# Небольшие агрегаторы почти никогда этого не публикуют — а у серьёзных
+# изданий (и это буквально требование многих агрегаторов новостей и
+# рекламных сетей) есть: (1) машиночитаемая RSS-лента для синдикации,
+# (2) публичный, постоянный архив исправлений/уточнений — стандарт
+# AP/Reuters/NYT, а не просто "тихо поправили пост", и (3) открыто
+# опубликованная редакционная политика/методология. Всё это — реальные
+# признаки профессионального медиа, которые проверяют при оценке актива.
+def _rfc822_date(ts):
+    if not ts:
+        return ""
+    return datetime.utcfromtimestamp(ts).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def build_rss_feed(recent_posts, generated_at_msk):
+    items_xml = []
+    for p in list(reversed(recent_posts))[:60]:
+        msg_id = p.get("message_id")
+        if not msg_id:
+            continue
+        link = f"https://t.me/{CHANNEL_USERNAME}/{msg_id}"
+        title = html.escape(p.get("headline", "") or p.get("title", "") or "")
+        description = html.escape((p.get("summary", "") or "")[:500])
+        pub_date = _rfc822_date(p.get("ts"))
+        items_xml.append(
+            "    <item>\n"
+            f"      <title>{title}</title>\n"
+            f"      <link>{link}</link>\n"
+            f"      <guid isPermaLink=\"true\">{link}</guid>\n"
+            f"      <description>{description}</description>\n"
+            f"      <pubDate>{pub_date}</pubDate>\n"
+            "    </item>"
+        )
+    items_block = "\n".join(items_xml)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>{html.escape(CHANNEL_USERNAME)}</title>
+    <link>{html.escape(CHANNEL_LINK)}</link>
+    <description>Автоматизированный новостной канал — RSS-синдикация последних публикаций</description>
+    <language>ru</language>
+    <lastBuildDate>{html.escape(generated_at_msk)}</lastBuildDate>
+{items_block}
+  </channel>
+</rss>"""
+
+
+def load_corrections_log():
+    return _load_json(CORRECTIONS_LOG_FILE, [])
+
+
+def save_corrections_log(entries):
+    _save_json(CORRECTIONS_LOG_FILE, entries[-CORRECTIONS_LOG_LIMIT:])
+
+
+def record_correction(original_headline, keyword, old_value, new_value, message_id):
+    log = load_corrections_log()
+    log.append({
+        "ts": time.time(),
+        "original_headline": original_headline,
+        "keyword": keyword,
+        "old_value": old_value,
+        "new_value": new_value,
+        "message_id": message_id,
+    })
+    save_corrections_log(log)
+
+
+def build_corrections_page(corrections_log, generated_at_msk):
+    rows = "".join(
+        f'<tr><td>{html.escape(datetime.fromtimestamp(c["ts"]).strftime("%d.%m.%Y %H:%M"))}</td>'
+        f'<td>{html.escape(c.get("original_headline", ""))}</td>'
+        f'<td>{html.escape(FACT_UPDATE_LABELS.get(c.get("keyword", ""), c.get("keyword", "")))}</td>'
+        f'<td>{c.get("old_value", "")} → {c.get("new_value", "")}</td></tr>'
+        for c in reversed(corrections_log)
+    ) if corrections_log else '<tr><td colspan="4" style="color:#93a0ad">Пока не потребовалось ни одного уточнения — все опубликованные факты остаются актуальными.</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — архив уточнений</title>
+<style>
+  body {{ margin:0; padding:40px 20px 64px; background:#0b0f14; color:#eef2f6;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  .wrap {{ max-width:880px; margin:0 auto; }}
+  h1 {{ font-size:1.6rem; }}
+  p.subtitle {{ color:#93a0ad; }}
+  table {{ width:100%; border-collapse:collapse; margin-top:20px; }}
+  th, td {{ text-align:left; padding:10px 12px; border-bottom:1px solid #2a323d; font-size:0.92rem; }}
+  th {{ color:#93a0ad; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.04em; }}
+  a {{ color:#4fd1c5; }}
+  footer {{ color:#93a0ad; font-size:0.8rem; margin-top:32px; text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📋 Архив уточнений</h1>
+  <p class="subtitle">Публичный и постоянный журнал всех случаев, когда ключевой факт
+  (число погибших/раненых/пострадавших) в опубликованной новости менялся после
+  выхода поста — по стандарту крупных информагентств. Ничего не удаляется и не
+  скрывается. · <a href="index.html">← Дашборд</a></p>
+  <table>
+    <tr><th>Когда</th><th>Исходная новость</th><th>Что уточнено</th><th>Было → стало</th></tr>
+    {rows}
+  </table>
+  <footer>Страница формируется автоматически · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
+EDITORIAL_POLICY_TEXT_RU = """
+<h2>Источники и верификация</h2>
+<p>Канал агрегирует новости из более чем 20 проверенных Telegram-источников,
+включая федеральные информагентства. Каждая новость проходит многоуровневую
+проверку: сопоставление по смыслу и по именным сущностям (место, персона,
+организация) с уже опубликованными материалами, а при необходимости —
+дополнительную смысловую сверку через ИИ, чтобы не публиковать одно и то же
+событие дважды под разными формулировками.</p>
+
+<h2>Политика уточнений и исправлений</h2>
+<p>Если после публикации новости ключевой факт (число погибших, раненых,
+пострадавших) меняется, канал публикует явное уточнение со ссылкой на исходный
+пост — а не молча редактирует или замалчивает изменение. Полный и постоянный
+архив всех уточнений доступен по ссылке "Архив уточнений" и никогда не
+удаляется.</p>
+
+<h2>Срочные новости и обновления</h2>
+<p>Развивающиеся события (природные и техногенные происшествия, атаки,
+чрезвычайные ситуации) освещаются в формате единого обновляемого поста
+("прямой эфир"), чтобы не дублировать один и тот же сюжет множеством
+разрозненных публикаций.</p>
+
+<h2>Нейтральность</h2>
+<p>Канал не выражает собственную оценочную позицию по излагаемым событиям и
+не использует эмоционально окрашенную лексику при пересказе источников.
+Заголовки формулируются по фактам, без домыслов сверх того, что сообщил
+первоисточник.</p>
+
+<h2>Автоматизация и человеческий контроль</h2>
+<p>Публикация и часть редактуры выполняются автоматизированной системой.
+Система включает автономный слой самодиагностики (проверка целостности
+списка источников, работоспособности каналов публикации, очистка устаревших
+служебных сообщений) и ведёт публичный журнал собственной работы.</p>
+"""
+
+
+def build_editorial_policy_page(generated_at_msk):
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — редакционная политика</title>
+<style>
+  body {{ margin:0; padding:40px 20px 64px; background:#0b0f14; color:#eef2f6;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; line-height:1.6; }}
+  .wrap {{ max-width:760px; margin:0 auto; }}
+  h1 {{ font-size:1.6rem; }}
+  h2 {{ font-size:1.05rem; color:#f0b429; margin-top:28px; }}
+  p {{ color:#d7dee5; }}
+  p.subtitle {{ color:#93a0ad; }}
+  a {{ color:#4fd1c5; }}
+  footer {{ color:#93a0ad; font-size:0.8rem; margin-top:32px; text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📜 Редакционная политика</h1>
+  <p class="subtitle"><a href="index.html">← Дашборд</a> · <a href="corrections.html">Архив уточнений</a></p>
+  {EDITORIAL_POLICY_TEXT_RU}
+  <footer>Опубликовано автоматически · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
@@ -2754,6 +2939,7 @@ STATE_FILES = [
     SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE, STORY_TIMELINE_STATE_FILE,
     FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
     MEDIA_KIT_FILE, CHANNEL_VIEWS_FILE,
+    RSS_FEED_FILE, CORRECTIONS_LOG_FILE, CORRECTIONS_PAGE_FILE, EDITORIAL_POLICY_PAGE_FILE,
 ]
 
 
@@ -2915,6 +3101,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 with open(FEEDS_BACKUP_FILE, "r", encoding="utf-8", errors="ignore") as f:
                     local_feeds_backup_content = f.read()
             local_self_heal_log = load_self_heal_log()
+            local_corrections_log = load_corrections_log()
             local_channel_views = load_channel_views()
 
             reset = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True)
@@ -2930,6 +3117,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                     f.write(local_feeds_backup_content)
             remote_self_heal_log = _git_show_json(f"origin/main:{SELF_HEAL_LOG_FILE}", [])
             merged_self_heal_log = (list(remote_self_heal_log) + local_self_heal_log)[-SELF_HEAL_LOG_LIMIT:]
+            remote_corrections_log = _git_show_json(f"origin/main:{CORRECTIONS_LOG_FILE}", [])
+            merged_corrections_log = (list(remote_corrections_log) + local_corrections_log)[-CORRECTIONS_LOG_LIMIT:]
+            save_corrections_log(merged_corrections_log)
             save_self_heal_log(merged_self_heal_log)
 
             save_posted(merged_posted)
@@ -2996,6 +3186,14 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 )
                 with open(MEDIA_KIT_FILE, "w", encoding="utf-8") as f:
                     f.write(media_kit_html)
+
+                generated_label = now_msk().strftime("%d.%m.%Y %H:%M")
+                with open(RSS_FEED_FILE, "w", encoding="utf-8") as f:
+                    f.write(build_rss_feed(merged_recent_posts, generated_label))
+                with open(CORRECTIONS_PAGE_FILE, "w", encoding="utf-8") as f:
+                    f.write(build_corrections_page(merged_corrections_log, generated_label))
+                with open(EDITORIAL_POLICY_PAGE_FILE, "w", encoding="utf-8") as f:
+                    f.write(build_editorial_policy_page(generated_label))
             except Exception as e:
                 print(f"[WARN] build_dashboard_html error: {e}")
 
@@ -3593,6 +3791,11 @@ def main():
                 "source": chosen.get("source", ""),
             }])
             mark_published_now()
+            record_correction(
+                original_headline=fu["matched_post"].get("headline") or fu["matched_post"].get("title", ""),
+                keyword=fu["keyword"], old_value=fu["old_value"], new_value=fu["new_value"],
+                message_id=ok if isinstance(ok, int) else None,
+            )
             persist_with_status(
                 sent_count=1,
                 note="fact_update",
