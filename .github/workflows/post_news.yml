@@ -2,6 +2,7 @@ name: News Bot
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 permissions:
   contents: write
 concurrency:
@@ -10,6 +11,16 @@ concurrency:
 jobs:
   post-news:
     runs-on: ubuntu-latest
+    # ФИКС: без явного лимита GitHub Actions по умолчанию разрешает job
+    # выполняться до 6 часов. Если один запуск подвиснет на сетевых
+    # ретраях (git push retries, HTTP retries к Telegram/GigaChat), он
+    # будет держать concurrency-группу занятой аномально долго, и все
+    # последующие запуски по cron (каждые 5 минут) будут просто
+    # выстраиваться в очередь / вытеснять друг друга, не публикуя ничего
+    # реально нового — со стороны это выглядит как "бот замолчал". 10
+    # минут — с большим запасом покрывает нормальный сценарий (реальные
+    # прогоны занимают 1-4 минуты, см. историю запусков).
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
