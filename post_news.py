@@ -701,6 +701,135 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
     return best
 
 
+# --- "Крутая" фича: живая трансляция развивающегося события ---
+# Вместо серии разрозненных постов об одном теракте/происшествии — ОДНО
+# закреплённое сообщение, которое бот сам редактирует (editMessageText)
+# по мере поступления новых деталей, как live-блог у крупных изданий.
+# Полноценной непрерывной трансляции без постоянно работающего сервера
+# не сделать (GitHub Actions — это периодические запуски, а не процесс
+# 24/7), но между запусками разница обычно секунды-минуты, и для
+# читателя это выглядит как живое обновление одного и того же поста.
+# Намеренное ограничение: одновременно ведётся только ОДНА живая
+# трансляция — так проще гарантировать, что ничего не потеряется и не
+# перепутается между параллельными сюжетами.
+LIVE_STORIES_FILE = "live_stories.json"
+LIVE_STORY_MAX_AGE_HOURS = 12   # трансляция считается завершённой, если
+                                 # обновлений не было дольше этого времени
+LIVE_STORY_MAX_UPDATES = 15     # старые обновления обрезаются, чтобы не
+                                 # упереться в лимит длины сообщения Telegram
+
+
+def load_live_threads():
+    raw = _load_json(LIVE_STORIES_FILE, [])
+    return [t for t in raw if isinstance(t, dict) and t.get("message_id")]
+
+
+def save_live_threads(threads):
+    _save_json(LIVE_STORIES_FILE, threads)
+
+
+def find_active_live_thread(candidate_title, candidate_summary, threads, exclude_entities=None):
+    exclude_entities = exclude_entities or set()
+    now = time.time()
+    c_entities = (extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)) - exclude_entities
+    if not c_entities:
+        return None
+    for thread in threads:
+        if now - thread.get("last_update_ts", 0) > LIVE_STORY_MAX_AGE_HOURS * 3600:
+            continue  # трансляция "остыла" — считаем её завершённой
+        t_entities = set(thread.get("entities", [])) - exclude_entities
+        if c_entities & t_entities:
+            return thread
+    return None
+
+
+def build_live_text(thread):
+    lines = [f"🔴 <b>ПРЯМОЙ ЭФИР: {thread['headline']}</b>", ""]
+    for update in thread.get("updates", [])[-LIVE_STORY_MAX_UPDATES:]:
+        lines.append(f"⏱ {update['time']} — {update['text']}")
+    lines.append("")
+    lines.append("<i>Обновляется по мере поступления новых данных.</i>")
+    return "\n".join(lines)
+
+
+def pin_message(message_id):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
+    try:
+        resp = request_with_retry("POST", url, json={
+            "chat_id": CHAT_ID, "message_id": message_id, "disable_notification": True,
+        }, timeout=10)
+        return bool(resp.json().get("ok"))
+    except Exception as e:
+        print(f"[WARN] pinChatMessage error: {e}")
+        return False
+
+
+def unpin_message(message_id):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/unpinChatMessage"
+    try:
+        resp = request_with_retry("POST", url, json={"chat_id": CHAT_ID, "message_id": message_id}, timeout=10)
+        return bool(resp.json().get("ok"))
+    except Exception as e:
+        print(f"[WARN] unpinChatMessage error: {e}")
+        return False
+
+
+def edit_message_text(message_id, text):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    try:
+        resp = request_with_retry("POST", url, json={
+            "chat_id": CHAT_ID, "message_id": message_id, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": True,
+        }, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            # "message is not modified" — не ошибка, а идемпотентность;
+            # остальное — реальная проблема (например, пост слишком старый
+            # для редактирования, Telegram лимитирует правки старше 48ч).
+            if "not modified" not in str(data.get("description", "")):
+                print(f"[WARN] editMessageText failed: {data}")
+            return "not modified" in str(data.get("description", ""))
+        return True
+    except Exception as e:
+        print(f"[WARN] editMessageText error: {e}")
+        return False
+
+
+def start_live_thread(item, message_id):
+    now = time.time()
+    now_msk_time = (datetime.utcnow() + MSK_OFFSET).strftime("%H:%M")
+    entities = list((extract_entity_stems(item["title"]) | extract_entity_stems(item.get("summary", ""))))
+    return {
+        "message_id": message_id,
+        "headline": item.get("headline") or item.get("title", ""),
+        "entities": entities,
+        "started_ts": now,
+        "last_update_ts": now,
+        "updates": [{"time": now_msk_time, "text": item.get("body") or item.get("title", "")}],
+    }
+
+
+def append_live_update(thread, item):
+    now_msk_time = (datetime.utcnow() + MSK_OFFSET).strftime("%H:%M")
+    thread = dict(thread)
+    thread["last_update_ts"] = time.time()
+    thread["updates"] = thread.get("updates", []) + [{
+        "time": now_msk_time,
+        "text": item.get("body") or item.get("title", ""),
+    }]
+    # Новые упомянутые имена тоже добавляем — сюжет мог "прирасти" новыми
+    # действующими лицами по ходу развития (например, назвали подозреваемого).
+    new_entities = extract_entity_stems(item["title"]) | extract_entity_stems(item.get("summary", ""))
+    thread["entities"] = list(set(thread.get("entities", [])) | new_entities)
+    return thread
+
+
 MAX_AI_DEDUPE_CHECKS = 5  # ограничиваем число вызовов ИИ на дедуп за один запуск
 
 
@@ -1860,7 +1989,7 @@ STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
-    SPEED_STATS_FILE, QUIZ_STATE_FILE,
+    SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE,
 ]
 
 
@@ -1919,6 +2048,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
             remote_speed_stats = _git_show_json(f"origin/main:{SPEED_STATS_FILE}", [])
+            remote_live_threads = _git_show_json(f"origin/main:{LIVE_STORIES_FILE}", [])
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -1966,6 +2096,25 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             local_speed_stats = load_speed_stats()
             merged_speed_stats = (list(remote_speed_stats) + local_speed_stats)[-SPEED_STATS_LIMIT:]
 
+            # live_stories.json — мёржим по message_id, оставляя для каждого
+            # треда версию с более свежим last_update_ts (та, что "видела"
+            # больше обновлений), и сразу отбрасываем остывшие трансляции
+            # (без обновлений дольше LIVE_STORY_MAX_AGE_HOURS), чтобы файл
+            # не рос бесконечно завершёнными сюжетами.
+            local_live_threads = load_live_threads()
+            by_message_id = {}
+            for t in (list(remote_live_threads) + local_live_threads):
+                if not isinstance(t, dict) or not t.get("message_id"):
+                    continue
+                mid = t["message_id"]
+                if mid not in by_message_id or t.get("last_update_ts", 0) > by_message_id[mid].get("last_update_ts", 0):
+                    by_message_id[mid] = t
+            _now_ts = time.time()
+            merged_live_threads = [
+                t for t in by_message_id.values()
+                if _now_ts - t.get("last_update_ts", 0) <= LIVE_STORY_MAX_AGE_HOURS * 3600
+            ]
+
             merged_digest = new_digest_state if new_digest_state is not None else remote_digest
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
             merged_quiz = new_quiz_state if new_quiz_state is not None else remote_quiz
@@ -1993,6 +2142,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(STATUS_FILE, merged_status)
             _save_json(RECENT_POSTS_FILE, merged_recent_posts)
             _save_json(SPEED_STATS_FILE, merged_speed_stats)
+            _save_json(LIVE_STORIES_FILE, merged_live_threads)
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -2265,6 +2415,51 @@ def main():
     )
 
     chosen = finalize_item(chosen)
+
+    # ЖИВАЯ ТРАНСЛЯЦИЯ: только для срочных новостей. Если кандидат — явное
+    # развитие уже идущей трансляции (общее место/персона, трансляция не
+    # "остыла"), редактируем существующий закреплённый пост вместо
+    # публикации нового — читатель видит один растущий живой пост, а не
+    # ленту разрозненных сообщений об одном и том же событии.
+    if chosen.get("urgent"):
+        live_threads_now = load_live_threads()
+        common_entities_live = compute_common_entity_stems(load_recent_posts())
+        active_thread = find_active_live_thread(
+            chosen["title"], chosen.get("summary", ""), live_threads_now,
+            exclude_entities=common_entities_live,
+        )
+        if active_thread:
+            updated_thread = append_live_update(active_thread, chosen)
+            if edit_message_text(active_thread["message_id"], build_live_text(updated_thread)):
+                other_threads = [t for t in live_threads_now if t.get("message_id") != active_thread["message_id"]]
+                save_live_threads(other_threads + [updated_thread])
+                posted = load_posted()
+                posted.add(chosen["id"])
+                posted.add(chosen["title_key"])
+                save_posted(posted)
+                new_posted_ids = [chosen["id"], chosen["title_key"]]
+                new_title_words_list = []
+                if chosen.get("content_words"):
+                    recent_words = load_recent_title_words()
+                    recent_words.append(set(chosen["content_words"]))
+                    save_recent_title_words(recent_words)
+                    new_title_words_list.append(chosen["content_words"])
+                mark_published_now()
+                persist_with_status(
+                    sent_count=1,
+                    note="live_thread_update",
+                    new_posted_ids=new_posted_ids,
+                    new_title_words_list=new_title_words_list,
+                    new_last_publish=time.time(),
+                    new_digest_state=new_digest_state,
+                    new_poll_state=new_poll_state,
+                    new_weekly_recap_state=new_weekly_recap_state,
+                    new_quiz_state=new_quiz_state,
+                )
+                print(f"[DONE] Live thread updated (message {active_thread['message_id']}): "
+                      f"'{chosen['title'][:50]}'")
+                return
+
     news = [chosen][:ITEMS_PER_RUN]
 
     posted = load_posted()
@@ -2295,6 +2490,14 @@ def main():
             latency = compute_publish_latency_seconds(item.get("published"))
             if latency is not None:
                 save_speed_stats(load_speed_stats() + [{"latency_seconds": latency, "ts": time.time()}])
+            if item.get("urgent") and isinstance(ok, int):
+                # Срочная новость без подходящей активной трансляции —
+                # начинаем новую и закрепляем пост, чтобы дальнейшие
+                # обновления по этой теме редактировали именно его.
+                new_thread = start_live_thread(item, ok)
+                save_live_threads(load_live_threads() + [new_thread])
+                pin_message(ok)
+                print(f"[INFO] Started new live thread (message {ok}).")
             sent_count += 1
             time.sleep(SEND_DELAY)
         else:
