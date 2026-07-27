@@ -140,9 +140,6 @@ def pick_poll_variant(day_key):
 
 POLL_STATE_FILE = "last_poll.json"
 
-CHANNEL_REACTIONS = ["👍", "🔥", "😱", "😢", "🤔"]
-REACTIONS_STATE_FILE = "reactions_enabled.json"
-
 URGENT_KEYWORDS = [
     "погиб", "убит", "жертв", "экстренн", "чрезвычайн", "эвакуац",
     "взрыв", "теракт", "катастроф", "введен режим чс",
@@ -1844,27 +1841,6 @@ def format_weekly_recap(items):
     return "\n".join(lines).strip()
 
 
-def enable_reactions():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setChatAvailableReactions"
-    payload = {
-        "chat_id": CHAT_ID,
-        "available_reactions": [{"type": "emoji", "emoji": e} for e in CHANNEL_REACTIONS],
-    }
-    try:
-        resp = request_with_retry("POST", url, json=payload, timeout=10)
-        data = resp.json()
-        if not data.get("ok"):
-            print(f"[WARN] setChatAvailableReactions failed: {data}")
-            return False
-        print("[INFO] Reactions enabled.")
-        return True
-    except Exception as e:
-        print(f"[WARN] setChatAvailableReactions error: {e}")
-        return False
-
-
 def format_digest(items, slot_label):
     lines = [f"{CHANNEL_MARK} <b>{slot_label}</b>", ""]
     for i, it in enumerate(items, 1):
@@ -1882,7 +1858,7 @@ def format_digest(items, slot_label):
 
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
-    DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
+    DIGEST_STATE_FILE, POLL_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
     SPEED_STATS_FILE, QUIZ_STATE_FILE,
 ]
@@ -1900,7 +1876,7 @@ def _git_show_json(ref_path, default):
 
 
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
-                          new_digest_state=None, new_poll_state=None, new_reactions_enabled=None,
+                          new_digest_state=None, new_poll_state=None,
                           new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
                           new_quiz_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
@@ -1940,7 +1916,6 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
             remote_quiz = _git_show_json(f"origin/main:{QUIZ_STATE_FILE}", {"date": None, "sent": False})
             remote_weekly_recap = _git_show_json(f"origin/main:{WEEKLY_RECAP_STATE_FILE}", {"week_key": None, "sent": False})
-            remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
             remote_speed_stats = _git_show_json(f"origin/main:{SPEED_STATS_FILE}", [])
@@ -1995,9 +1970,6 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
             merged_quiz = new_quiz_state if new_quiz_state is not None else remote_quiz
             merged_weekly_recap = new_weekly_recap_state if new_weekly_recap_state is not None else remote_weekly_recap
-            merged_reactions = {
-                "enabled": bool(new_reactions_enabled) or bool(remote_reactions.get("enabled"))
-            }
             merged_alert = {
                 "last_alert": max(remote_alert.get("last_alert", 0), new_alert_timestamp or 0)
             }
@@ -2017,7 +1989,6 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(POLL_STATE_FILE, merged_poll)
             _save_json(QUIZ_STATE_FILE, merged_quiz)
             _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
-            _save_json(REACTIONS_STATE_FILE, merged_reactions)
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
             _save_json(RECENT_POSTS_FILE, merged_recent_posts)
@@ -2068,12 +2039,6 @@ def main():
         )
 
     # --- Реакции: включаем один раз, статус запоминаем, чтобы не дёргать API зря ---
-    reactions_state = _load_json(REACTIONS_STATE_FILE, {"enabled": False})
-    new_reactions_enabled = None
-    if not reactions_state.get("enabled"):
-        if enable_reactions():
-            new_reactions_enabled = True
-
     # --- Ежедневный вовлекающий опрос ---
     poll_state = _load_json(POLL_STATE_FILE, {"date": None, "sent": False})
     if poll_state.get("date") != day_key:
@@ -2204,7 +2169,6 @@ def main():
                     new_last_publish=time.time(),
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
-                    new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 )
@@ -2223,12 +2187,11 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
-                new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
             )
@@ -2237,12 +2200,11 @@ def main():
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:no_news",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
-                new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
             )
@@ -2261,12 +2223,11 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
-                    new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
                 )
@@ -2283,12 +2244,11 @@ def main():
     chosen = pick_non_duplicate(ordered)
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
-                new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
             )
@@ -2353,7 +2313,6 @@ def main():
         new_last_publish=new_last_publish,
         new_digest_state=new_digest_state,
         new_poll_state=new_poll_state,
-        new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
     )
