@@ -2502,6 +2502,22 @@ def main():
     # опубликовано (например, дайджестом) уже после того, как мы собрали
     # список кандидатов.
     chosen = pick_non_duplicate(ordered)
+
+    # ФИКС (реальный кейс из лога): если срочные новости ЕСТЬ, но ВСЕ они
+    # оказались дублями уже опубликованного — раньше бот сдавался на всём
+    # запуске целиком, хотя в пуле могли быть десятки обычных (не срочных)
+    # свежих кандидатов, которые даже не рассматривались. Теперь при таком
+    # исходе даём вторую попытку на обычных новостях вместо того, чтобы
+    # выбрасывать весь прогон впустую.
+    if chosen is None and urgent_items:
+        if elapsed is None or elapsed >= PUBLISH_INTERVAL:
+            print("[INFO] Все срочные кандидаты — дубли, пробуем обычные новости из того же пула.")
+            fallback_ordered = order_candidates_by_priority(prefer_video(normal_items), _recent_posts_for_priority)
+            chosen = pick_non_duplicate(fallback_ordered)
+        else:
+            print(f"[INFO] Все срочные кандидаты — дубли, но с последней публикации прошло "
+                  f"{int(elapsed)} сек (меньше {PUBLISH_INTERVAL} сек) — обычные новости пока не пробуем.")
+
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
         if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
