@@ -63,8 +63,22 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 FEEDS_FILE = "feeds.txt"
 POSTED_FILE = "posted.json"
 LAST_RUN_FILE = "last_run.json"
-PUBLISH_INTERVAL = 600
+PUBLISH_INTERVAL = 300  # ФИКС: было 600 (10 мин) — цель "раз в 5-10 минут"
+                        # требует нижней границы диапазона как базовый
+                        # интервал, а не верхней.
 URGENT_INTERVAL = 120
+# ФИКС (по прямому запросу "новости раз в 5-10 минут"): раньше не было
+# никакого "аварийного" механизма — если строгий дедуп (по смыслу, по
+# именным стемам, по мнению ИИ) отклонял ВСЕ кандидаты несколько циклов
+# подряд, бот просто ждал следующего запуска без каких-либо гарантий, и
+# реальный промежуток между постами мог растянуться на часы. Теперь если
+# с последней публикации прошло больше этого времени, а строгий дедуп
+# всё ещё ничего не пропускает, бот берёт первую ещё НЕ опубликованную
+# новость, ослабив только смысловые проверки (по стему/смыслу/ИИ) — но
+# не публикуя дважды буквально один и тот же пост (id/title_key всё
+# равно исключаются). Это гарантирует частоту ценой редкого риска
+# почти-дубля вместо часов тишины.
+GUARANTEED_CADENCE_SECONDS = 600
 ITEMS_PER_RUN = 1
 FETCH_POOL_SIZE = 60
 FETCH_TIMEOUT = 15
@@ -1206,6 +1220,25 @@ def pick_non_duplicate(items):
     print(f"[INFO] pick_non_duplicate: все {len(items)} кандидатов отклонены — "
           f"уже опубликовано: {reasons['already_posted']}, дубль по смыслу: {reasons['meaning_dup']}, "
           f"дубль по стему: {reasons['entity_dup']}, дубль по мнению ИИ: {reasons['ai_dup']}.")
+    return None
+
+
+def pick_any_not_posted(items):
+    # ФИКС ("гарантированная частота публикаций"): используется только
+    # как аварийный fallback, когда строгий pick_non_duplicate() отклонил
+    # ВСЁ, а с последней публикации прошло больше GUARANTEED_CADENCE_
+    # SECONDS. Пропускаем смысловые/энтити/ИИ-проверки — оставляем только
+    # защиту от публикации буквально одного и того же поста дважды
+    # (id/title_key). Так канал не молчит часами из-за перестраховки
+    # дедупа, ценой редкого риска почти-дубля, сформулированного другими
+    # словами.
+    posted_now = load_posted()
+    for it in items:
+        if it["id"] in posted_now or it["title_key"] in posted_now:
+            continue
+        print(f"[INFO] pick_any_not_posted: берём '{it['title'][:50]}' в аварийном режиме "
+              f"(гарантия частоты публикаций), смысловые проверки ослаблены.")
+        return it
     return None
 
 
@@ -2633,6 +2666,12 @@ def main():
         else:
             print(f"[INFO] Все срочные кандидаты — дубли, но с последней публикации прошло "
                   f"{int(elapsed)} сек (меньше {PUBLISH_INTERVAL} сек) — обычные новости пока не пробуем.")
+
+    if chosen is None and elapsed is not None and elapsed >= GUARANTEED_CADENCE_SECONDS:
+        print(f"[INFO] С последней публикации прошло {int(elapsed)} сек "
+              f"(больше {GUARANTEED_CADENCE_SECONDS} сек) — строгий дедуп ничего не пропустил, "
+              f"пробуем аварийный режим для гарантии частоты публикаций.")
+        chosen = pick_any_not_posted(news)
 
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
