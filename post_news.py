@@ -1352,6 +1352,35 @@ def get_subscriber_count():
         return None
 
 
+# --- Данные для публичного дашборда (см. build_dashboard_html ниже) ---
+# Один сэмпл в день достаточен для графика роста подписчиков — не нужна
+# поминутная точность, а хранить историю тогда компактно и просто:
+# список {"date": "YYYY-MM-DD", "count": N}, один элемент на дату.
+SUBSCRIBER_HISTORY_FILE = "subscriber_history.json"
+SUBSCRIBER_HISTORY_LIMIT = 365
+
+
+def load_subscriber_history():
+    raw = _load_json(SUBSCRIBER_HISTORY_FILE, [])
+    return [p for p in raw if isinstance(p, dict) and p.get("date") and isinstance(p.get("count"), (int, float))]
+
+
+def save_subscriber_history(history):
+    trimmed = history[-SUBSCRIBER_HISTORY_LIMIT:]
+    _save_json(SUBSCRIBER_HISTORY_FILE, trimmed)
+
+
+def merge_subscriber_history(history_a, history_b):
+    # Мёржим по дате, оставляя последнее известное значение на дату
+    # (порядок неважен — обе истории уже отсортированы по дате добавления).
+    by_date = {}
+    for entry in list(history_a) + list(history_b):
+        by_date[entry["date"]] = entry["count"]
+    merged = [{"date": d, "count": c} for d, c in by_date.items()]
+    merged.sort(key=lambda e: e["date"])
+    return merged[-SUBSCRIBER_HISTORY_LIMIT:]
+
+
 def update_channel_description(count):
     if count is None or not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -1701,6 +1730,132 @@ def send_quiz_poll(quiz):
         return False
 
 
+# --- "Крутая" фича: утренняя сводка по рынкам ---
+# Формат, который используют топовые деловые СМИ (РБК, Коммерсантъ, Frank
+# Media) каждое утро: курсы валют + индекс биржи со стрелочками роста/
+# падения к предыдущему дню. Данные берутся из ДВУХ официальных бесплатных
+# источников без ключей API:
+#   - ЦБ РФ (cbr.ru) — официальные курсы валют, публикуются раз в сутки;
+#   - Мосбиржа (MOEX ISS API, iss.moex.com) — текущее значение индекса
+#     IMOEX прямо с торгов, тоже открытый JSON без авторизации.
+# Индекс МосБиржи — необязательная "вишенка": если формат ответа MOEX
+# API вдруг изменится или сервис недоступен, сводка всё равно уйдёт с
+# одними курсами валют, просто без строки по индексу — деградация
+# плавная, а не отказ всей фичи.
+MARKET_SNAPSHOT_TIME = "09:30"  # МСК, после утреннего дайджеста (08:00)
+MARKET_WINDOW_MINUTES = DIGEST_WINDOW_MINUTES
+MARKET_STATE_FILE = "market_state.json"
+MIN_MARKET_GAP_SECONDS = 20 * 3600
+CBR_RATES_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
+MOEX_IMOEX_URL = (
+    "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/"
+    "securities/IMOEX.json?iss.meta=off"
+)
+MARKET_CURRENCIES = [
+    ("USD", "$", "Доллар"),
+    ("EUR", "€", "Евро"),
+    ("CNY", "¥", "Юань"),
+]
+
+
+def due_market_snapshot(dt, already_sent_today):
+    if already_sent_today:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, MARKET_SNAPSHOT_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= MARKET_WINDOW_MINUTES
+
+
+def fetch_cbr_rates():
+    # Официальный ежедневный XML ЦБ РФ — без ключей, без авторизации.
+    try:
+        import xml.etree.ElementTree as ET
+        resp = request_with_retry("GET", CBR_RATES_URL, timeout=(5, 15))
+        resp.raise_for_status()
+        resp.encoding = "windows-1251"
+        root = ET.fromstring(resp.text)
+        rates = {}
+        for valute in root.findall("Valute"):
+            char_code = valute.findtext("CharCode", "")
+            if char_code not in {c for c, _, _ in MARKET_CURRENCIES}:
+                continue
+            nominal_raw = valute.findtext("Nominal", "1").replace(",", ".")
+            value_raw = valute.findtext("Value", "").replace(",", ".")
+            try:
+                nominal = float(nominal_raw) or 1.0
+                value = float(value_raw)
+            except ValueError:
+                continue
+            rates[char_code] = value / nominal
+        return rates or None
+    except Exception as e:
+        print(f"[WARN] fetch_cbr_rates error: {e}")
+        return None
+
+
+def fetch_moex_imoex():
+    # Индекс МосБиржи в реальном времени — публичный JSON MOEX ISS API.
+    # Обёрнуто максимально defensively: если структура ответа окажется
+    # другой (поле переименовали, торги не идут и т.п.) — просто
+    # возвращаем None, и сводка уйдёт без строки по индексу.
+    try:
+        resp = request_with_retry("GET", MOEX_IMOEX_URL, timeout=(5, 15))
+        resp.raise_for_status()
+        data = resp.json()
+        md = data.get("marketdata", {})
+        columns = md.get("columns", [])
+        rows = md.get("data", [])
+        if not columns or not rows:
+            return None
+        row = rows[0]
+        col_idx = {name: i for i, name in enumerate(columns)}
+        last_idx = col_idx.get("LAST") or col_idx.get("CURRENTVALUE")
+        change_idx = col_idx.get("LASTTOPREVPRICE") or col_idx.get("LASTCHANGEPRC")
+        if last_idx is None or row[last_idx] is None:
+            return None
+        result = {"value": float(row[last_idx])}
+        if change_idx is not None and row[change_idx] is not None:
+            result["change_pct"] = float(row[change_idx])
+        return result
+    except Exception as e:
+        print(f"[WARN] fetch_moex_imoex error: {e}")
+        return None
+
+
+def _format_change_arrow(current, previous):
+    if previous is None:
+        return ""
+    diff = current - previous
+    if abs(diff) < 1e-9:
+        return " ▬ 0.00"
+    arrow = "▲" if diff > 0 else "▼"
+    return f" {arrow} {diff:+.2f}"
+
+
+def format_market_snapshot(rates, index_data, prev_state):
+    prev_rates = (prev_state or {}).get("rates", {})
+    prev_index = (prev_state or {}).get("index_value")
+
+    lines = [f"💹 <b>Рынки к {MARKET_SNAPSHOT_TIME} мск</b>", ""]
+    for code, symbol, _name in MARKET_CURRENCIES:
+        value = rates.get(code)
+        if value is None:
+            continue
+        arrow = _format_change_arrow(value, prev_rates.get(code))
+        lines.append(f"{symbol} {value:.2f}{arrow}")
+
+    if index_data and index_data.get("value") is not None:
+        idx_val = index_data["value"]
+        arrow = _format_change_arrow(idx_val, prev_index)
+        lines.append("")
+        lines.append(f"Индекс МосБиржи: {idx_val:.1f}{arrow}")
+
+    lines.append("")
+    lines.append("<i>Курсы ЦБ РФ на сегодня, индекс МосБиржи — текущие торги.</i>")
+    return "\n".join(lines).strip()
+
+
 WEEKLY_RECAP_WEEKDAY = 6
 WEEKLY_RECAP_TIME = "20:00"
 WEEKLY_RECAP_WINDOW_MINUTES = 4
@@ -1796,11 +1951,182 @@ def format_digest(items, slot_label):
     return "\n".join(lines).strip()
 
 
+# --- "Крутая" фича: публичный live-дашборд канала ---
+# Статическая HTML-страница со статистикой бота — как status-страница у
+# серьёзных сервисов (health, скорость публикаций, рост подписчиков,
+# вклад источников, последние заголовки). Генерируется и коммитится в
+# docs/index.html ТЕМ ЖЕ механизмом, что уже пишет posted.json и другие
+# state-файлы (см. persist_state_to_git) — отдельный деплой-пайплайн не
+# нужен. Чтобы страница стала доступна по ссылке, один раз включите в
+# репозитории: Settings → Pages → Source: Deploy from a branch → main → /docs.
+# Никаких внешних JS-библиотек не используется (график — инлайновый SVG),
+# страница работает даже без интернета у посетителя, кроме загрузки самой
+# страницы.
+DOCS_DIR = "docs"
+DASHBOARD_FILE = os.path.join(DOCS_DIR, "index.html")
+# ФИКС: по умолчанию GitHub Pages прогоняет содержимое /docs через Jekyll,
+# который трактует одиночные фигурные скобки в инлайновом CSS/JS как
+# потенциальный Liquid-синтаксис ({{ }} / {% %}) и может упасть на сборке
+# (см. "pages build and deployment" — красный крест, сайт отдаёт 404).
+# .nojekyll — стандартный флаг-файл, который отключает эту обработку:
+# наш дашборд — чистый статический HTML, Jekyll ему не нужен.
+NOJEKYLL_FILE = os.path.join(DOCS_DIR, ".nojekyll")
+
+
+def _svg_sparkline(history, width=640, height=140, pad=24):
+    if not history or len(history) < 2:
+        return ""
+    values = [h["count"] for h in history]
+    min_v, max_v = min(values), max(values)
+    span = (max_v - min_v) or 1
+    n = len(values)
+    step = (width - 2 * pad) / (n - 1)
+
+    def x(i):
+        return pad + i * step
+
+    def y(v):
+        return height - pad - ((v - min_v) / span) * (height - 2 * pad)
+
+    points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
+    last_x, last_y = x(n - 1), y(values[-1])
+    first_date = html.escape(history[0]["date"])
+    last_date = html.escape(history[-1]["date"])
+    return f"""
+    <svg viewBox="0 0 {width} {height}" class="sparkline" xmlns="http://www.w3.org/2000/svg">
+      <polyline fill="none" stroke="#4fd1c5" stroke-width="2.5" points="{points}" />
+      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4.5" fill="#4fd1c5" />
+      <text x="{pad}" y="{height - 4}" class="spark-label">{first_date}</text>
+      <text x="{width - pad}" y="{height - 4}" class="spark-label" text-anchor="end">{last_date}</text>
+    </svg>
+    """
+
+
+def build_dashboard_html(status, recent_posts, subscriber_history, source_contribution, generated_at_msk):
+    status = status or {}
+    healthy = status.get("healthy")
+    health_badge = ("🟢 Работает штатно" if healthy else "🔴 Возможен сбой — новостей давно не было")
+    seconds_since = status.get("seconds_since_last_publish")
+    if seconds_since is not None:
+        minutes = int(seconds_since // 60)
+        last_publish_label = f"{minutes} мин назад" if minutes < 60 else f"{minutes // 60} ч {minutes % 60} мин назад"
+    else:
+        last_publish_label = "нет данных"
+
+    avg_latency = status.get("avg_publish_latency_minutes")
+    median_latency = status.get("median_publish_latency_minutes")
+    speed_samples = status.get("speed_samples_count") or 0
+
+    current_subs = subscriber_history[-1]["count"] if subscriber_history else None
+    sparkline_svg = _svg_sparkline(subscriber_history)
+
+    top_sources = list(source_contribution.items())[:8]
+    source_rows = "".join(
+        f'<div class="bar-row"><span class="bar-label">{html.escape(src)}</span>'
+        f'<div class="bar-track"><div class="bar-fill" style="width:{min(100, count / (top_sources[0][1] or 1) * 100):.0f}%"></div></div>'
+        f'<span class="bar-count">{count}</span></div>'
+        for src, count in top_sources
+    ) if top_sources else '<p class="muted">Пока нет данных</p>'
+
+    recent_rows = "".join(
+        f'<li><span class="cat-emoji">{detect_category(p.get("headline", ""), p.get("summary", ""))[0]}</span>'
+        f'{html.escape(truncate_at_word(p.get("headline", ""), 110))}</li>'
+        for p in list(reversed(recent_posts))[:12]
+    ) if recent_posts else '<li class="muted">Пока нет опубликованных новостей</li>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — статус канала</title>
+<style>
+  :root {{
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #4fd1c5;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 32px 16px 64px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  .wrap {{ max-width: 880px; margin: 0 auto; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
+  .subtitle {{ color: var(--muted); margin-top: 0; margin-bottom: 28px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }}
+  .card .label {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
+  .card .value {{ font-size: 1.6rem; font-weight: 600; margin-top: 6px; }}
+  .card.wide {{ grid-column: 1 / -1; }}
+  .sparkline {{ width: 100%; height: auto; margin-top: 8px; }}
+  .spark-label {{ fill: var(--muted); font-size: 11px; }}
+  .bar-row {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; }}
+  .bar-label {{ width: 140px; font-size: 0.85rem; color: var(--muted); flex-shrink: 0; }}
+  .bar-track {{ flex: 1; background: #21262d; border-radius: 6px; height: 10px; overflow: hidden; }}
+  .bar-fill {{ background: var(--accent); height: 100%; border-radius: 6px; }}
+  .bar-count {{ width: 36px; text-align: right; font-size: 0.85rem; color: var(--muted); }}
+  ul {{ list-style: none; padding: 0; margin: 8px 0 0; }}
+  li {{ padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.92rem; }}
+  li:last-child {{ border-bottom: none; }}
+  .cat-emoji {{ margin-right: 8px; }}
+  .muted {{ color: var(--muted); }}
+  footer {{ color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }}
+  a {{ color: var(--accent); }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
+  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a></p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Статус</div>
+      <div class="value" style="font-size:1.1rem">{health_badge}</div>
+    </div>
+    <div class="card">
+      <div class="label">Последняя публикация</div>
+      <div class="value" style="font-size:1.1rem">{last_publish_label}</div>
+    </div>
+    <div class="card">
+      <div class="label">Подписчиков</div>
+      <div class="value">{current_subs if current_subs is not None else "—"}</div>
+    </div>
+    <div class="card">
+      <div class="label">Скорость публикации (медиана)</div>
+      <div class="value">{f"{median_latency:.0f} мин" if median_latency is not None else "—"}</div>
+    </div>
+  </div>
+
+  <div class="card wide">
+    <div class="label">Рост подписчиков</div>
+    {sparkline_svg or '<p class="muted">Накапливаем историю — график появится через несколько дней</p>'}
+  </div>
+
+  <div class="grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="card">
+      <div class="label">Вклад источников (последние посты)</div>
+      {source_rows}
+    </div>
+    <div class="card">
+      <div class="label">Последние новости</div>
+      <ul>{recent_rows}</ul>
+    </div>
+  </div>
+
+  <footer>Обновляется автоматически ботом · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
+
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
-    SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE,
+    SPEED_STATS_FILE, QUIZ_STATE_FILE, LIVE_STORIES_FILE, MARKET_STATE_FILE,
+    SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE,
 ]
 
 
@@ -1818,7 +2144,7 @@ def _git_show_json(ref_path, default):
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None,
                           new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
-                          new_quiz_state=None):
+                          new_quiz_state=None, new_market_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return True
     import subprocess
@@ -1843,11 +2169,13 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_digest = _git_show_json(f"origin/main:{DIGEST_STATE_FILE}", {"date": None, "slots": []})
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
             remote_quiz = _git_show_json(f"origin/main:{QUIZ_STATE_FILE}", {"date": None, "sent": False})
+            remote_market = _git_show_json(f"origin/main:{MARKET_STATE_FILE}", {"date": None, "sent": False})
             remote_weekly_recap = _git_show_json(f"origin/main:{WEEKLY_RECAP_STATE_FILE}", {"week_key": None, "sent": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
             remote_recent_posts = _git_show_json(f"origin/main:{RECENT_POSTS_FILE}", [])
             remote_speed_stats = _git_show_json(f"origin/main:{SPEED_STATS_FILE}", [])
             remote_live_threads = _git_show_json(f"origin/main:{LIVE_STORIES_FILE}", [])
+            remote_subscriber_history = _git_show_json(f"origin/main:{SUBSCRIBER_HISTORY_FILE}", [])
 
             merged_posted = set(remote_posted) | set(new_posted_ids)
             merged_recent = []
@@ -1919,6 +2247,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_digest = _merge_daily_state(remote_digest, new_digest_state)
             merged_poll = _merge_daily_state(remote_poll, new_poll_state)
             merged_quiz = _merge_daily_state(remote_quiz, new_quiz_state)
+            merged_market = _merge_daily_state(remote_market, new_market_state)
             merged_weekly_recap = _merge_daily_state(remote_weekly_recap, new_weekly_recap_state)
             merged_alert = {
                 "last_alert": max(remote_alert.get("last_alert", 0), new_alert_timestamp or 0)
@@ -1938,12 +2267,36 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             _save_json(DIGEST_STATE_FILE, merged_digest)
             _save_json(POLL_STATE_FILE, merged_poll)
             _save_json(QUIZ_STATE_FILE, merged_quiz)
+            _save_json(MARKET_STATE_FILE, merged_market)
             _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
             _save_json(ALERT_STATE_FILE, merged_alert)
             _save_json(STATUS_FILE, merged_status)
             _save_json(RECENT_POSTS_FILE, merged_recent_posts)
             _save_json(SPEED_STATS_FILE, merged_speed_stats)
             _save_json(LIVE_STORIES_FILE, merged_live_threads)
+
+            local_subscriber_history = load_subscriber_history()
+            merged_subscriber_history = merge_subscriber_history(remote_subscriber_history, local_subscriber_history)
+            save_subscriber_history(merged_subscriber_history)
+
+            # Дашборд генерируется из уже смёрженных данных (та же логика,
+            # что видит статус-снапшот) — так публичная страница не может
+            # разъехаться с тем, что реально записано в state-файлах.
+            try:
+                os.makedirs(DOCS_DIR, exist_ok=True)
+                with open(NOJEKYLL_FILE, "w", encoding="utf-8"):
+                    pass
+                dashboard_html = build_dashboard_html(
+                    status=merged_status,
+                    recent_posts=merged_recent_posts,
+                    subscriber_history=merged_subscriber_history,
+                    source_contribution=source_contribution_summary(merged_recent_posts),
+                    generated_at_msk=now_msk().strftime("%d.%m.%Y %H:%M"),
+                )
+                with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
+                    f.write(dashboard_html)
+            except Exception as e:
+                print(f"[WARN] build_dashboard_html error: {e}")
 
             subprocess.run(["git", "add", *STATE_FILES], check=False)
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
@@ -2034,9 +2387,45 @@ def main():
             new_quiz_state = quiz_state
             print("[INFO] No material/quiz for today, marking as done anyway.")
 
+    # --- Утренняя сводка по рынкам (курсы валют ЦБ + индекс МосБиржи) ---
+    market_state = _load_json(MARKET_STATE_FILE, {"date": None, "sent": False, "last_sent_ts": 0})
+    if market_state.get("date") != day_key:
+        market_state = {"date": day_key, "sent": False, "last_sent_ts": market_state.get("last_sent_ts", 0)}
+    new_market_state = None
+    if due_market_snapshot(dt_msk, market_state.get("sent")) and \
+            (now_ts - market_state.get("last_sent_ts", 0)) >= MIN_MARKET_GAP_SECONDS:
+        rates = fetch_cbr_rates()
+        if rates:
+            index_data = fetch_moex_imoex()
+            prev_state = _load_json(MARKET_STATE_FILE, {})
+            text = format_market_snapshot(rates, index_data, prev_state)
+            if send_to_telegram(text):
+                market_state["sent"] = True
+                market_state["last_sent_ts"] = now_ts
+                market_state["rates"] = rates
+                if index_data and index_data.get("value") is not None:
+                    market_state["index_value"] = index_data["value"]
+                new_market_state = market_state
+                print("[INFO] Market snapshot sent.")
+        else:
+            # Курсы ЦБ недоступны (например, сервис лёг) — помечаем день
+            # пройденным, чтобы не долбить cbr.ru каждые 5 минут в это же
+            # окно; попробуем снова завтра утром.
+            market_state["sent"] = True
+            market_state["last_sent_ts"] = now_ts
+            new_market_state = market_state
+            print("[WARN] CBR rates unavailable, skipping market snapshot for today.")
+
     count = get_subscriber_count()
     update_channel_description(count)
     maybe_celebrate_milestone(count)
+    if count is not None:
+        # Для графика роста на дашборде достаточно одной точки в день —
+        # merge_subscriber_history сам заменит сегодняшнюю точку, если она
+        # уже была записана более ранним прогоном сегодня.
+        save_subscriber_history(
+            merge_subscriber_history(load_subscriber_history(), [{"date": day_key, "count": count}])
+        )
 
     # --- Еженедельный рекап "Главное за неделю" ---
     week_key = week_key_for(dt_msk)
@@ -2125,6 +2514,7 @@ def main():
                     new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
                 )
                 print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
                 return
@@ -2141,26 +2531,28 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
             )
         return
 
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
             persist_with_status(
                 note="skip:no_news",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
             )
         return
 
@@ -2179,13 +2571,14 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+            if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
                 )
             return
         normal_items = prefer_video(normal_items)
@@ -2204,13 +2597,14 @@ def main():
 
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
+        if new_digest_state or new_poll_state or new_alert_timestamp or new_weekly_recap_state or new_quiz_state or new_market_state:
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
             )
         return
 
@@ -2256,6 +2650,7 @@ def main():
                     new_poll_state=new_poll_state,
                     new_weekly_recap_state=new_weekly_recap_state,
                     new_quiz_state=new_quiz_state,
+                    new_market_state=new_market_state,
                 )
                 print(f"[DONE] Live thread updated (message {active_thread['message_id']}): "
                       f"'{chosen['title'][:50]}'")
@@ -2317,6 +2712,7 @@ def main():
         new_poll_state=new_poll_state,
                 new_weekly_recap_state=new_weekly_recap_state,
                 new_quiz_state=new_quiz_state,
+                new_market_state=new_market_state,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
