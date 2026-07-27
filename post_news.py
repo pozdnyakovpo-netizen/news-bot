@@ -162,6 +162,13 @@ CATEGORY_RULES = [
         "футбол", "хокке", "теннис", "матч", "турнир", "чемпионат", "сборная",
         "тренер", "клуб", "олимпиад", "спортсмен", "чм-", "забил гол",
     ]),
+    ("🎖", "#сво", [
+        # Признак: намеренно НЕ используем короткое "сво" отдельно — оно
+        # совпадает как подстрока со словами "своевременно", "свобода",
+        # "свои" и т.п. Только специфичные, длинные и однозначные термины.
+        "спецоперац", "донбасс", "лнр", "днр", "запорожь", "херсонск",
+        "линия фронта", "зсу", "вс рф", "мобилизац",
+    ]),
     ("🚨", "#происшествия", [
         "погиб", "убит", "жертв", "дтп", "авари", "пожар", "взрыв", "теракт",
         "эвакуац", "чрезвычайн", "пострадал", "разыскива", "задержан", "суд",
@@ -173,6 +180,13 @@ CATEGORY_RULES = [
     ("🏛", "#политика", [
         "путин", "госдума", "правительств", "министр", "закон", "указ",
         "переговор", "саммит", "президент", "депутат", "заседан",
+    ]),
+    ("🏙", "#москва", [
+        # Намеренно узкие муниципальные фразы, а не голое "москв" — иначе
+        # категория ловила бы вообще любую новость, где Москва упомянута
+        # просто как место работы федерального правительства.
+        "мэр москвы", "мэрия москвы", "департамент москвы", "подмосков",
+        "метро москв", "мкад", "новая москва", "правительство москвы",
     ]),
     ("💻", "#технологии", [
         # ФИКС: было короткое "ии" для ловли аббревиатуры ИИ — но это
@@ -1275,7 +1289,13 @@ def finalize_item(item):
 
     # Признак 5: короткая атрибуция источника в конце поста — просто
     # @handle канала-первоисточника, без ссылки и без цитирования текста.
-    item["attribution"] = item.get("source") if item.get("source_channel") else None
+    # "Крутая фишка": для приоритетного источника (ТАСС) атрибуция
+    # дополняется меткой доверия — читатель сразу видит, что это
+    # официальное агентство, а не рядовой агрегатор.
+    if item.get("source_channel") == TASS_CHANNEL:
+        item["attribution"] = f"📡 {item.get('source', '')} — приоритетный источник"
+    else:
+        item["attribution"] = item.get("source") if item.get("source_channel") else None
 
     # "Почему это важно" — контекстная строка от AI (см. rewrite_with_ai).
     # Только для НЕсрочных постов: у срочных и так формат-"молния", лишняя
@@ -1698,6 +1718,83 @@ def speed_stats_summary(samples):
     }
 
 
+def source_contribution_summary(recent_posts):
+    # Признак: сколько реально ОПУБЛИКОВАННЫХ (не просто увиденных) постов
+    # дал каждый источник за время, что хранится в recent_posts.json.
+    # Нужно для того, чтобы решать, какие каналы из feeds.txt сокращать,
+    # по фактическим данным — а не гадая по одним названиям.
+    counts = {}
+    for post in recent_posts:
+        src = post.get("source") or "неизвестно"
+        counts[src] = counts.get(src, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
+
+
+# --- Приоритет источников и категорий по запросу пользователя ---
+# Пользователь задал: (1) приоритетные категории — Политика, Финансы,
+# СВО, Москва, Происшествия, Спорт; (2) ТАСС — главный источник с целевой
+# долей публикаций ~30%, остальное — пропорционально.
+#
+# "30%" — это ЦЕЛЬ ДЛЯ ДИСТАНЦИИ МНОГИХ ПУБЛИКАЦИЙ, не гарантия для
+# каждого отдельного поста (за один запуск публикуется 1 новость, точную
+# долю физически невозможно выдержать на каждом шаге). Поэтому вместо
+# фиксированного множителя вес ТАСС считается САМОКОРРЕКТИРУЮЩИМСЯ: берём
+# реальную статистику по уже ОПУБЛИКОВАННЫМ постам (source_contribution_
+# summary, который мы уже вели) — если ТАСС в последнее время публикуется
+# РЕЖЕ 30% — его вес при выборе растёт; если ЧАЩЕ — вес падает. Система
+# сама тянется к цели, а не полагается на угаданную константу.
+PRIORITY_CATEGORY_TAGS = {
+    "#политика", "#экономика", "#сво", "#москва", "#происшествия", "#спорт",
+}
+TASS_CHANNEL = "tass_agency"
+TARGET_TASS_SHARE = 0.30
+PRIORITY_CATEGORY_BONUS = 1.5  # прибавка к весу за попадание в приоритетную категорию
+
+
+def compute_tass_weight_multiplier(recent_posts, min_sample=5):
+    contribution = source_contribution_summary(recent_posts)
+    total = sum(contribution.values())
+    if total < min_sample:
+        # Данных мало (например, только запустили бота) — стартуем с
+        # заметного, но не экстремального множителя, чтобы не начинать
+        # с перекоса, пока статистика не накопилась.
+        return 2.0
+    tass_count = contribution.get(f"@{TASS_CHANNEL}", 0)
+    current_share = tass_count / total
+    if current_share >= TARGET_TASS_SHARE:
+        # ТАСС уже на целевой доле или выше — не поднимаем вес искусственно,
+        # но и не наказываем: другим источникам просто дают равные шансы.
+        return 1.0
+    deficit = TARGET_TASS_SHARE - current_share
+    # Чем сильнее фактическая доля отстаёт от цели, тем выше множитель —
+    # линейная чувствительность с разумным потолком, чтобы не превращать
+    # выбор в гарантированный "всегда ТАСС" даже при большом отставании.
+    return min(1.0 + deficit * 12, 5.0)
+
+
+def compute_candidate_priority_weight(item, tass_multiplier):
+    weight = 1.0
+    _, cat_tag = detect_category(item.get("title", ""), item.get("summary", ""))
+    if cat_tag in PRIORITY_CATEGORY_TAGS:
+        weight += PRIORITY_CATEGORY_BONUS
+    if item.get("source_channel") == TASS_CHANNEL:
+        weight *= tass_multiplier
+    return weight
+
+
+def order_candidates_by_priority(items, recent_posts):
+    # Детерминированная сортировка по убыванию веса — так результат
+    # предсказуем и проверяем тестами, в отличие от случайного выбора.
+    # На дистанции многих запусков это и даёт нужный перекос в сторону
+    # ТАСС и приоритетных категорий, не будучи "лотереей" на каждом шаге.
+    if not items:
+        return []
+    tass_multiplier = compute_tass_weight_multiplier(recent_posts)
+    weighted = [(compute_candidate_priority_weight(it, tass_multiplier), it) for it in items]
+    weighted.sort(key=lambda pair: pair[0], reverse=True)
+    return [it for _, it in weighted]
+
+
 def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
     # Признак 4: снимок состояния для внешнего мониторинга (например,
     # UptimeRobot может проверять поле "healthy" в сыром файле status.json).
@@ -1711,6 +1808,7 @@ def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
         "avg_publish_latency_minutes": speed["avg_minutes"],
         "median_publish_latency_minutes": speed["median_minutes"],
         "speed_samples_count": speed["count"],
+        "source_contribution": source_contribution_summary(load_recent_posts()),
     }
 
 
@@ -2252,7 +2350,11 @@ def main():
     slot = due_digest_slot(dt_msk, digest_state.get("slots", []))
     if slot:
         digest_items = fetch_news()
-        digest_items.sort(key=lambda it: not it.get("urgent"))  # срочные — в начало
+        # Срочные — в начало, дальше внутри каждой группы — по приоритету
+        # категорий пользователя и источника ТАСС (та же система, что и
+        # в одиночных постах).
+        digest_items = order_candidates_by_priority(digest_items, load_recent_posts())
+        digest_items.sort(key=lambda it: not it.get("urgent"))
 
         # РАДИКАЛЬНЫЙ ФИКС: та же проверка по словам+именным стемам
         # (Уровень B), что и в pick_non_duplicate — без неё дайджест мог
@@ -2302,6 +2404,7 @@ def main():
                         "summary": it.get("summary", ""),
                         "ts": time.time(),
                         "message_id": digest_msg_id if isinstance(digest_msg_id, int) else None,
+                        "source": it.get("source", ""),
                     })
                 save_posted(posted)
                 save_recent_title_words(recent_words)
@@ -2367,8 +2470,13 @@ def main():
         with_video = [it for it in items if it.get("video")]
         return with_video if with_video else items
 
+    # Приоритет по категориям пользователя (Политика/Финансы/СВО/Москва/
+    # Происшествия/Спорт) и по источнику ТАСС — применяется и к срочным,
+    # и к обычным кандидатам, как единая система, а не выбор ИИ "на глаз".
+    _recent_posts_for_priority = load_recent_posts()
+
     if urgent_items:
-        ordered = prefer_video(urgent_items)
+        ordered = order_candidates_by_priority(prefer_video(urgent_items), _recent_posts_for_priority)
     else:
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
@@ -2383,9 +2491,11 @@ def main():
                 )
             return
         normal_items = prefer_video(normal_items)
-        featured_idx = pick_featured_index(normal_items)
-        # AI-выбранный кандидат идёт первым, остальные — запасные варианты
-        ordered = [normal_items[featured_idx]] + [it for i, it in enumerate(normal_items) if i != featured_idx]
+        # ФИКС: раньше здесь ИИ (pick_featured_index) выбирал "самую
+        # интересную" новость на своё усмотрение — заменено на явную
+        # приоритетную систему по категориям пользователя и источнику
+        # ТАСС, как и было запрошено, вместо непрозрачного выбора ИИ.
+        ordered = order_candidates_by_priority(normal_items, _recent_posts_for_priority)
 
     # ФИКС: финальная проверка на дубликат прямо перед отправкой (см.
     # pick_non_duplicate) — на случай, если что-то очень похожее было
@@ -2486,6 +2596,7 @@ def main():
                 "summary": item.get("summary", ""),
                 "ts": time.time(),
                 "message_id": ok if isinstance(ok, int) else None,
+                "source": item.get("source", ""),
             }])
             latency = compute_publish_latency_seconds(item.get("published"))
             if latency is not None:
