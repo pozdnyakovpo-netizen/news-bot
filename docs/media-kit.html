@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>deepdailyfact — медиакит</title>
+<style>
+  :root {
+    --bg: #0b0f14; --card: #151b23; --border: #2a323d;
+    --text: #eef2f6; --muted: #93a0ad; --accent: #f0b429; --accent2: #4fd1c5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 48px 20px 72px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.8rem; font-weight: 600; }
+  h1 { font-size: 2.2rem; margin: 8px 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 36px; font-size: 1.05rem; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 28px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+  .stat-card .label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-card .value { font-size: 1.9rem; font-weight: 700; margin-top: 8px; color: var(--accent2); }
+  .stat-card .sub { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+  .section { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px 26px; margin-bottom: 20px; }
+  .section h2 { font-size: 1.1rem; margin: 0 0 14px; color: var(--accent); }
+  .sparkline { width: 100%; height: auto; margin-top: 6px; }
+  .spark-label { fill: var(--muted); font-size: 11px; }
+  ul.features { list-style: none; padding: 0; margin: 0; }
+  ul.features li { padding: 10px 0 10px 28px; border-bottom: 1px solid var(--border); position: relative; font-size: 0.95rem; }
+  ul.features li:last-child { border-bottom: none; }
+  ul.features li::before { content: "✓"; position: absolute; left: 0; color: var(--accent2); font-weight: 700; }
+  footer { color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }
+  a { color: var(--accent2); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">Медиакит канала</div>
+  <h1>📡 deepdailyfact</h1>
+  <p class="subtitle">Автоматизированный новостной канал полного цикла — от сбора до аналитики.
+  <a href="https://t.me/deepdailyfact">Открыть канал</a> ·
+  <a href="index.html">Живой дашборд</a></p>
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">Подписчиков</div>
+      <div class="value">2</div>
+      <div class="sub">рост +0.0% за период наблюдения</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Просмотров на пост (медиана)</div>
+      <div class="value">—</div>
+      <div class="sub">накапливаем историю</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Всего просмотров отслежено</div>
+      <div class="value">0</div>
+      <div class="sub">по 0 последним постам</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Скорость публикации</div>
+      <div class="value">70 мин</div>
+      <div class="sub">от появления новости у источника</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Рост аудитории</h2>
+    <p style="color:var(--muted)">Накапливаем историю — график появится через несколько дней</p>
+  </div>
+
+  <div class="section">
+    <h2>Надёжность инфраструктуры</h2>
+    <p style="margin:0 0 6px">Стабильно, без длительных простоев</p>
+    <p style="margin:0; color:var(--muted); font-size:0.9rem">
+      Автономная система самодиагностики выполнила 0 автоматических
+      исправлений без вмешательства человека — полный журнал доступен на
+      <a href="index.html">дашборде</a>.
+    </p>
+  </div>
+
+  <div class="section">
+    <h2>Технологический стек и конкурентные преимущества</h2>
+    <ul class="features"><li>Публикация из 20+ проверенных источников с приоритетом официальных агентств (ТАСС)</li><li>Многоуровневый дедуп: по смыслу, по именным сущностям и через ИИ-сверку — не дублирует уже освещённые события</li><li>Автоматическое обнаружение изменившихся фактов (число погибших/пострадавших) — публикует явные уточнения, а не тихо теряет обновления</li><li>«Прямые эфиры» — развивающиеся истории обновляются в одном закреплённом посте, а не спамят лентой</li><li>Автоматическая хроника: бот сам находит связанные посты за 2 недели и синтезирует связный разбор истории через ИИ</li><li>Ежедневный опрос, викторина по реальным новостям канала и еженедельный дайджест для вовлечения аудитории</li><li>Утренняя сводка по рынкам (курсы ЦБ, индекс МосБиржи) — не только новости, но и деловая ценность</li><li>Публичный live-дашборд статистики и автономный слой самодиагностики: бот сам обнаруживает и чинит сбои (отозванный токен, испорченные конфиги, зависшие процессы)</li><li>Гарантированная частота публикаций (аварийный режим не даёт каналу замолчать надолго)</li></ul>
+  </div>
+
+  <footer>
+    Страница формируется автоматически ботом на основе собственных данных канала ·
+    последнее обновление: 28.07.2026 00:02 мск<br>
+    Это информационная сводка, а не формальная оценка стоимости актива.
+  </footer>
+</div>
+</body>
+</html>
