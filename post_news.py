@@ -1635,6 +1635,129 @@ def send_poll_to_telegram(question, options):
         return False
 
 
+# --- "Крутая" фича: ежедневный квиз по РЕАЛЬНЫМ опубликованным новостям ---
+# Использует нативный Quiz Poll в Telegram (type="quiz") — Telegram сам
+# подсвечивает правильный ответ и показывает объяснение всем, кто
+# проголосовал, сразу после голосования. Это не отдельная вручную
+# написанная механика, а встроенный формат самого Telegram, которым
+# редко пользуются небольшие каналы. Вопрос строится строго по фактам
+# уже опубликованного поста — никакие новости не выдумываются, квиз
+# только проверяет внимательность к тому, что реально было в канале.
+QUIZ_TIME = "15:00"  # МСК
+QUIZ_WINDOW_MINUTES = DIGEST_WINDOW_MINUTES
+QUIZ_STATE_FILE = "quiz_state.json"
+QUIZ_LOOKBACK_HOURS = 24
+
+
+def due_quiz(dt, already_sent_today):
+    if already_sent_today:
+        return False
+    now_minutes = dt.hour * 60 + dt.minute
+    slot_h, slot_m = map(int, QUIZ_TIME.split(":"))
+    slot_minutes = slot_h * 60 + slot_m
+    return 0 <= (now_minutes - slot_minutes) <= QUIZ_WINDOW_MINUTES
+
+
+def pick_quiz_source_post(recent_posts, hours=QUIZ_LOOKBACK_HOURS):
+    # Берём пост за последние сутки с достаточно содержательным текстом
+    # (короткие/технические записи не дают материала для вопроса) —
+    # предпочитаем самый свежий подходящий, чтобы квиз был об актуальном.
+    now = time.time()
+    candidates = [
+        p for p in recent_posts
+        if (not p.get("ts") or now - p["ts"] <= hours * 3600)
+        and len(p.get("summary", "")) >= 60
+    ]
+    return candidates[-1] if candidates else None
+
+
+def build_quiz_from_post(post):
+    # Просим GigaChat сформулировать вопрос СТРОГО по фактам из текста
+    # поста — с одним верным и тремя правдоподобными неверными вариантами,
+    # плюс короткое объяснение (Telegram покажет его после ответа).
+    token = get_gigachat_token()
+    if not token or not post:
+        return None
+    try:
+        prompt = (
+            "Вот новость, которая уже была опубликована в новостном Telegram-канале:\n"
+            f"Заголовок: {post.get('headline', '')}\n"
+            f"Текст: {post.get('summary', '')[:400]}\n\n"
+            "Составь по этой новости викторинный вопрос с 4 вариантами ответа "
+            "(только на основе фактов из текста выше, ничего не выдумывай "
+            "сверх того, что там написано). Один вариант верный, три — "
+            "правдоподобные, но неверные. Плюс короткое объяснение "
+            "(1 предложение, до 15 слов) правильного ответа.\n\n"
+            "Ответь СТРОГО в формате JSON без пояснений и без markdown-разметки:\n"
+            '{"question": "...", "options": ["...", "...", "...", "..."], '
+            '"correct_index": 0, "explanation": "..."}'
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.4,
+            "max_tokens": 400,
+        }
+        resp = request_with_retry("POST", GIGACHAT_CHAT_URL, headers=headers, json=payload, verify=False, timeout=(5, 20))
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        match = re.search(r'\{.*\}', answer, re.S)
+        if not match:
+            return None
+        data = json.loads(match.group())
+        question = str(data.get("question", "")).strip()
+        options = [str(o).strip() for o in data.get("options", [])]
+        correct_index = data.get("correct_index")
+        explanation = str(data.get("explanation", "")).strip()
+        # Валидация: ровно 4 варианта, корректный индекс, вопрос и варианты
+        # укладываются в лимиты самого Telegram (question ≤300, option ≤100).
+        if (not question or len(options) != 4 or not isinstance(correct_index, int)
+                or not (0 <= correct_index < 4) or any(not o for o in options)):
+            return None
+        if len(question) > 300 or any(len(o) > 100 for o in options):
+            return None
+        return {
+            "question": question,
+            "options": options,
+            "correct_index": correct_index,
+            "explanation": explanation[:200],
+        }
+    except Exception as e:
+        print(f"[WARN] build_quiz_from_post error: {e}")
+        return None
+
+
+def send_quiz_poll(quiz):
+    if not TELEGRAM_TOKEN or not CHAT_ID or not quiz:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPoll"
+    payload = {
+        "chat_id": CHAT_ID,
+        "question": quiz["question"],
+        "options": quiz["options"],
+        "type": "quiz",
+        "correct_option_id": quiz["correct_index"],
+        "is_anonymous": True,
+    }
+    if quiz.get("explanation"):
+        payload["explanation"] = quiz["explanation"]
+    try:
+        resp = request_with_retry("POST", url, json=payload, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[WARN] sendQuizPoll failed: {data}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[WARN] sendQuizPoll error: {e}")
+        return False
+
+
 # --- Еженедельный рекап "Главное за неделю" ---
 WEEKLY_RECAP_WEEKDAY = 6         # 0=понедельник ... 6=воскресенье (МСК)
 WEEKLY_RECAP_TIME = "20:00"      # МСК
@@ -1761,7 +1884,7 @@ STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE, REACTIONS_STATE_FILE,
     ALERT_STATE_FILE, STATUS_FILE, RECENT_POSTS_FILE, WEEKLY_RECAP_STATE_FILE,
-    SPEED_STATS_FILE,
+    SPEED_STATS_FILE, QUIZ_STATE_FILE,
 ]
 
 
@@ -1778,7 +1901,8 @@ def _git_show_json(ref_path, default):
 
 def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_last_publish=None,
                           new_digest_state=None, new_poll_state=None, new_reactions_enabled=None,
-                          new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None):
+                          new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
+                          new_quiz_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     import subprocess
@@ -1814,6 +1938,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             remote_milestones = _git_show_json(f"origin/main:{MILESTONES_FILE}", {"last": 0})
             remote_digest = _git_show_json(f"origin/main:{DIGEST_STATE_FILE}", {"date": None, "slots": []})
             remote_poll = _git_show_json(f"origin/main:{POLL_STATE_FILE}", {"date": None, "sent": False})
+            remote_quiz = _git_show_json(f"origin/main:{QUIZ_STATE_FILE}", {"date": None, "sent": False})
             remote_weekly_recap = _git_show_json(f"origin/main:{WEEKLY_RECAP_STATE_FILE}", {"week_key": None, "sent": False})
             remote_reactions = _git_show_json(f"origin/main:{REACTIONS_STATE_FILE}", {"enabled": False})
             remote_alert = _git_show_json(f"origin/main:{ALERT_STATE_FILE}", {"last_alert": 0})
@@ -1868,6 +1993,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
 
             merged_digest = new_digest_state if new_digest_state is not None else remote_digest
             merged_poll = new_poll_state if new_poll_state is not None else remote_poll
+            merged_quiz = new_quiz_state if new_quiz_state is not None else remote_quiz
             merged_weekly_recap = new_weekly_recap_state if new_weekly_recap_state is not None else remote_weekly_recap
             merged_reactions = {
                 "enabled": bool(new_reactions_enabled) or bool(remote_reactions.get("enabled"))
@@ -1889,6 +2015,7 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             save_last_milestone(merged_milestones["last"])
             _save_json(DIGEST_STATE_FILE, merged_digest)
             _save_json(POLL_STATE_FILE, merged_poll)
+            _save_json(QUIZ_STATE_FILE, merged_quiz)
             _save_json(WEEKLY_RECAP_STATE_FILE, merged_weekly_recap)
             _save_json(REACTIONS_STATE_FILE, merged_reactions)
             _save_json(ALERT_STATE_FILE, merged_alert)
@@ -1958,6 +2085,26 @@ def main():
             poll_state["sent"] = True
             new_poll_state = poll_state
             print(f"[INFO] Engagement poll sent: '{variant['question']}'")
+
+    # --- Ежедневный квиз по реальным опубликованным новостям ---
+    quiz_state = _load_json(QUIZ_STATE_FILE, {"date": None, "sent": False})
+    if quiz_state.get("date") != day_key:
+        quiz_state = {"date": day_key, "sent": False}
+    new_quiz_state = None
+    if due_quiz(dt_msk, quiz_state.get("sent")):
+        source_post = pick_quiz_source_post(load_recent_posts())
+        quiz = build_quiz_from_post(source_post)
+        if quiz and send_quiz_poll(quiz):
+            quiz_state["sent"] = True
+            new_quiz_state = quiz_state
+            print(f"[INFO] Daily quiz sent: '{quiz['question']}'")
+        else:
+            # Не нашлось материала или GigaChat не смог составить вопрос —
+            # помечаем день пройденным, чтобы не пытаться на каждом
+            # следующем тике в это же окно.
+            quiz_state["sent"] = True
+            new_quiz_state = quiz_state
+            print("[INFO] No material/quiz for today, marking as done anyway.")
 
     count = get_subscriber_count()
     update_channel_description(count)
@@ -2059,6 +2206,7 @@ def main():
                     new_poll_state=new_poll_state,
                     new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
                 )
                 print(f"[DONE] Digest sent ({slot}): {len(finalized)} items.")
                 return
@@ -2075,26 +2223,28 @@ def main():
     if elapsed is not None and elapsed < URGENT_INTERVAL:
         print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
               f"(меньше {URGENT_INTERVAL} сек), рано даже для срочной новости.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:too_soon_urgent",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
             )
         return
 
     news = fetch_news()
     if not news:
         print("[INFO] No new news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:no_news",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
             )
         return
 
@@ -2111,13 +2261,14 @@ def main():
         if elapsed is not None and elapsed < PUBLISH_INTERVAL:
             print(f"[INFO] Skipping run — с последней публикации прошло {int(elapsed)} сек "
                   f"(меньше {PUBLISH_INTERVAL} сек), срочных новостей нет.")
-            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
+            if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
                 persist_with_status(
                     note="skip:too_soon_normal",
                     new_digest_state=new_digest_state,
                     new_poll_state=new_poll_state,
                     new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
                 )
             return
         normal_items = prefer_video(normal_items)
@@ -2132,13 +2283,14 @@ def main():
     chosen = pick_non_duplicate(ordered)
     if chosen is None:
         print("[INFO] All candidates turned out to be duplicates of already-posted news.")
-        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state:
+        if new_digest_state or new_poll_state or new_reactions_enabled or new_alert_timestamp or new_weekly_recap_state or new_quiz_state:
             persist_with_status(
                 note="skip:all_duplicates",
                 new_digest_state=new_digest_state,
                 new_poll_state=new_poll_state,
                 new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
             )
         return
 
@@ -2203,6 +2355,7 @@ def main():
         new_poll_state=new_poll_state,
         new_reactions_enabled=new_reactions_enabled,
                 new_weekly_recap_state=new_weekly_recap_state,
+                new_quiz_state=new_quiz_state,
     )
 
     print(f"[DONE] Sent {sent_count}/{len(news)} items as separate posts.")
