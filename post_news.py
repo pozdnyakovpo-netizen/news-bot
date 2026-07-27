@@ -19,11 +19,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def request_with_retry(method, url, max_attempts=4, **kwargs):
-    # Признаки 1/2: единая точка retry для ЛЮБОГО HTTP-вызова в боте.
-    # Раньше сетевые обрывы (timeout, connection reset) не перехватывались
-    # почти нигде, кроме ручной проверки статус-кода 401/429 у GigaChat —
-    # обрыв соединения приводил к падению функции с первого раза.
-    # Дополнительно уважаем Retry-After, который Telegram присылает при 429.
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -55,36 +50,26 @@ def request_with_retry(method, url, max_attempts=4, **kwargs):
 
     raise last_exc if last_exc else RuntimeError(f"request_with_retry exhausted attempts for {url}")
 
-# --- Настройки ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-# Признак 3 (уведомление админу): отдельный чат/личка для служебных
-# алертов, чтобы не засорять сам новостной канал системными сообщениями.
-# Необязательный — если не задан, алерты просто логируются.
 ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
-SILENCE_ALERT_HOURS = 3  # если публикаций не было дольше этого — сигнал админу
+SILENCE_ALERT_HOURS = 3
 ALERT_STATE_FILE = "last_alert.json"
-STATUS_FILE = "status.json"  # признак 4: снимок состояния бота для внешнего мониторинга
-GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")  # "Ключ авторизации" из личного кабинета Sber
+STATUS_FILE = "status.json"
+GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")
 GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-FEEDS_FILE = "feeds.txt"           # список RSS-ссылок (по одной на строку)
-POSTED_FILE = "posted.json"        # хранит ID уже отправленных новостей
-LAST_RUN_FILE = "last_run.json"    # хранит время последней успешной публикации
-PUBLISH_INTERVAL = 600             # сек, интервал между ОБЫЧНЫМИ публикациями (10 минут)
-URGENT_INTERVAL = 120              # сек, интервал между СРОЧНЫМИ публикациями (2 минуты)
-ITEMS_PER_RUN = 1                  # сколько реально публикуем за один допустимый запуск
-FETCH_POOL_SIZE = 60                # ФИКС: было 12 — с 20 источниками в feeds.txt
-                                     # это обрывало сбор кандидатов ещё до того, как
-                                     # бот успевал заглянуть во все каналы (список
-                                     # перемешивается случайно, и первые попавшиеся
-                                     # 12 не обязательно самые важные). 60 даёт
-                                     # запас, чтобы обойти практически весь список
-                                     # источников за один запуск перед выбором.
-FETCH_TIMEOUT = 15                 # сек, таймаут на загрузку страницы канала
-AI_CALL_DELAY = 1.5                # сек, пауза между вызовами GigaChat
-SEND_DELAY = 1.5                   # сек, пауза между отправками отдельных постов
+FEEDS_FILE = "feeds.txt"
+POSTED_FILE = "posted.json"
+LAST_RUN_FILE = "last_run.json"
+PUBLISH_INTERVAL = 600
+URGENT_INTERVAL = 120
+ITEMS_PER_RUN = 1
+FETCH_POOL_SIZE = 60
+FETCH_TIMEOUT = 15
+AI_CALL_DELAY = 1.5
+SEND_DELAY = 1.5
 
 CHANNEL_USERNAME = "deepdailyfact"
 CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
@@ -105,16 +90,13 @@ CTA_VARIANTS = [
 MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
 MILESTONES_FILE = "milestones.json"
 
-# --- Вовлечённость: дайджесты по расписанию, опрос, реакции ---
-MSK_OFFSET = timedelta(hours=3)  # Москва не переходит на летнее/зимнее время с 2014 года
-DIGEST_TIMES = ["08:00", "21:00"]  # время публикации сводок по МСК
-DIGEST_SIZE = 5                     # сколько новостей включать в одну сводку
-DIGEST_WINDOW_MINUTES = 4           # окно срабатывания (cron раз в 2 минуты — берём с запасом)
+MSK_OFFSET = timedelta(hours=3)
+DIGEST_TIMES = ["08:00", "21:00"]
+DIGEST_SIZE = 5
+DIGEST_WINDOW_MINUTES = 4
 DIGEST_STATE_FILE = "last_digest.json"
 
-POLL_TIME = "12:00"  # МСК, время ежедневного вовлекающего опроса
-# ФИКС: было 4 варианта — теперь несколько вариантов, ротируются по дню,
-# чтобы подписчики не видели один и тот же вопрос каждый день.
+POLL_TIME = "12:00"
 POLL_VARIANTS = [
     {"question": "Какая тема сейчас интереснее всего?",
      "options": ["Политика", "Происшествия", "Спорт", "Технологии", "Экономика"]},
@@ -128,17 +110,23 @@ POLL_VARIANTS = [
 
 
 def pick_poll_variant(day_key):
-    # ФИКС: встроенный hash() в Python рандомизируется между запусками
-    # процесса (PYTHONHASHSEED) — на GitHub Actions каждый запуск это новый
-    # процесс, так что hash(day_key) был бы разным при каждом прогоне, а не
-    # стабильным в течение дня. hashlib.md5 даёт одинаковый результат
-    # всегда для одного и того же day_key, независимо от процесса.
     digest = hashlib.md5(day_key.encode("utf-8")).hexdigest()
     idx = int(digest, 16) % len(POLL_VARIANTS)
     return POLL_VARIANTS[idx]
 
 
 POLL_STATE_FILE = "last_poll.json"
+# ФИКС (см. журнал изменений внизу файла): минимальный запас по времени
+# между двумя отправками опроса/квиза/дайджеста/рекапа НЕЗАВИСИМО от
+# булевых флагов "sent" в state-файлах. Это защита на случай, если
+# git push состояния не удался (см. persist_state_to_git) — раньше
+# именно это привело к тому, что один и тот же ежедневный опрос ушёл в
+# канал дважды подряд (12:00 и 12:02), потому что второй запуск читал
+# ещё не обновлённое состояние из origin/main.
+MIN_POLL_GAP_SECONDS = 20 * 3600
+MIN_QUIZ_GAP_SECONDS = 20 * 3600
+MIN_DIGEST_GAP_SECONDS = 4 * 3600
+MIN_WEEKLY_RECAP_GAP_SECONDS = 3 * 24 * 3600
 
 URGENT_KEYWORDS = [
     "погиб", "убит", "жертв", "экстренн", "чрезвычайн", "эвакуац",
@@ -148,24 +136,12 @@ URGENT_KEYWORDS = [
 URGENT_EMOJIS = ["🔥", "🚨", "❗️", "⚡️"]
 CHANNEL_MARK = "🔷"
 
-# Признак топ-каналов (РИА/ТАСС/РБК): категорийный эмодзи-маркер вместо
-# одного статичного значка — ускоряет сканирование ленты — плюс хэштег
-# категории в конце поста для поиска по темам внутри канала.
 CATEGORY_RULES = [
-    # (эмодзи, хэштег, ключевые слова для распознавания)
     ("⚽️", "#спорт", [
-        # ФИКС: убраны "гол" (совпадало с "Голд" — название пляжа высадки
-        # в Нормандии, из-за чего историческая новость попала в #спорт)
-        # и "лига" (совпадает с "олигарх") — слишком короткие и опасные
-        # как совпадение-подстрока. Более длинные и специфичные слова
-        # такую коллизию дают заметно реже.
         "футбол", "хокке", "теннис", "матч", "турнир", "чемпионат", "сборная",
         "тренер", "клуб", "олимпиад", "спортсмен", "чм-", "забил гол",
     ]),
     ("🎖", "#сво", [
-        # Признак: намеренно НЕ используем короткое "сво" отдельно — оно
-        # совпадает как подстрока со словами "своевременно", "свобода",
-        # "свои" и т.п. Только специфичные, длинные и однозначные термины.
         "спецоперац", "донбасс", "лнр", "днр", "запорожь", "херсонск",
         "линия фронта", "зсу", "вс рф", "мобилизац",
     ]),
@@ -182,19 +158,10 @@ CATEGORY_RULES = [
         "переговор", "саммит", "президент", "депутат", "заседан",
     ]),
     ("🏙", "#москва", [
-        # Намеренно узкие муниципальные фразы, а не голое "москв" — иначе
-        # категория ловила бы вообще любую новость, где Москва упомянута
-        # просто как место работы федерального правительства.
         "мэр москвы", "мэрия москвы", "департамент москвы", "подмосков",
         "метро москв", "мкад", "новая москва", "правительство москвы",
     ]),
     ("💻", "#технологии", [
-        # ФИКС: было короткое "ии" для ловли аббревиатуры ИИ — но это
-        # совпадало как подстрока с окончанием "-ии" в тысячах обычных
-        # слов ("полиции", "территории", "срабатывании" и т.д.), из-за
-        # чего происшествия и другие новости ошибочно помечались как
-        # #технологии. "ии-" с дефисом безопаснее (так пишут "ИИ-стартап"),
-        # обычные слова с таким сочетанием почти не встречаются.
         "ии-", "искусственн интеллект", "нейросет", "чат-бот", "чатgpt",
         "смартфон", "приложен", "стартап", "кибер", "робот", "гаджет",
         "разработчик",
@@ -286,25 +253,13 @@ def strip_source_mentions(text):
     return text
 
 
-HEADLINE_MAX_LEN = 130  # ФИКС: было 55, потом 100 — по-прежнему резало на
-                        # середине мысли для длинных "сырых" заголовков без
-                        # ИИ-редактуры (fallback-путь без GigaChat), где
-                        # заголовок — это просто первое предложение источника
-                        # со всеми его придаточными. 130 — редкий аварийный
-                        # лимит, а не рабочий режим; вместе с более умной
-                        # обрезкой по запятой (см. truncate_at_word) это
-                        # покрывает подавляющее большинство реальных случаев.
+HEADLINE_MAX_LEN = 130
 
 
 def truncate_at_word(text, max_len=HEADLINE_MAX_LEN):
     if not text or len(text) <= max_len:
         return text
     cut = text[:max_len]
-    # ФИКС: сначала пробуем найти последнюю запятую в пределах окна — если
-    # она оставляет хотя бы 70% лимита, режем по ней: это обычно граница
-    # придаточного предложения ("...после наезда автомобиля, ..."), и
-    # результат читается как законченная мысль, а не оборванная на полуслове
-    # деталь. Если подходящей запятой нет — как раньше, режем по пробелу.
     last_comma = cut.rfind(",")
     if last_comma >= max_len * 0.7:
         cut = cut[:last_comma]
@@ -315,8 +270,6 @@ def truncate_at_word(text, max_len=HEADLINE_MAX_LEN):
     return cut.rstrip(" ,.;:—-") + "…"
 
 
-# Признак 4: типовые канцелярские вводные, которыми AI (и журналисты
-# низкого качества) любят открывать новость, ничего не добавляя по сути.
 CLICHE_OPENER_PATTERNS = [
     r'^как\s+(сообщается|стало известно|уточняется|сообщают|отмечается)[,:]?\s*',
     r'^по\s+(имеющимся\s+)?данным(\s+источник[а-я]*)?[,:]?\s*',
@@ -339,8 +292,6 @@ def strip_cliche_openers(text):
 
 
 def fix_shouty_caps(text):
-    # Признак 5: заголовок КАПСОМ выглядит как спам — если больше 60%
-    # букв заглавные, приводим к обычному предложенческому регистру.
     if not text:
         return text
     letters = [c for c in text if c.isalpha()]
@@ -365,9 +316,6 @@ _EMOJI_PATTERN = re.compile(
 
 
 def strip_decorative_emoji(text):
-    # Признак 3: убираем эмодзи, которые могла добавить сама AI —
-    # маркер категории/срочности бот уже ставит сам, дублирование эмодзи
-    # выглядит любительски.
     if not text:
         return text
     text = _EMOJI_PATTERN.sub("", text)
@@ -375,7 +323,6 @@ def strip_decorative_emoji(text):
 
 
 def collapse_repeated_punctuation(text):
-    # Признак 7: "!!!", "???", "...." — убираем до одного знака.
     if not text:
         return text
     text = re.sub(r'!{2,}', '!', text)
@@ -385,9 +332,6 @@ def collapse_repeated_punctuation(text):
 
 
 def sanitize_text(text):
-    # Финальная санитаризация перед отправкой (признак 10): прогоняет
-    # все точечные чистки разом и убирает случайные двойные пробелы,
-    # которые могли остаться после предыдущих замен.
     text = strip_decorative_emoji(text)
     text = collapse_repeated_punctuation(text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
@@ -478,17 +422,6 @@ TITLE_STOPWORDS = {
 
 
 def significant_title_words(title):
-    # ФИКС (радикальный): раньше сравнивались точные словоформы, а русский
-    # язык склоняет существительные и прилагательные по падежам —
-    # "Эльбрусе" (предложный падеж) и "Эльбруса" (родительный) для
-    # компьютера были РАЗНЫМИ словами, хотя означают одно и то же место.
-    # Из-за этого дубль одной новости от двух каналов ("тела эвакуированы
-    # с Эльбруса" / "погибших на Эльбрусе") мог не набрать порог схожести
-    # и проходил как "новая" новость. Обрезаем длинные слова до первых
-    # 6 символов — это не настоящая лемматизация, а грубая эвристика, но
-    # она гасит подавляющее большинство падежных/числовых окончаний
-    # ("-е", "-а", "-ов", "-ых" и т.п.), не путая при этом разные по сути
-    # слова (например "полиция" и "политика" всё равно не совпадут).
     t = title.lower()
     t = re.sub(r'[^a-zа-яё0-9\s]', ' ', t, flags=re.IGNORECASE)
     words = set()
@@ -501,51 +434,14 @@ def significant_title_words(title):
 
 
 def significant_words(text):
-    # То же самое, но для произвольного текста (используется для summary)
     return significant_title_words(text or "")
 
 
 def content_words(title, summary):
-    # ВАЖНО (фикс): раньше дедуп сравнивал только заголовки. Разные каналы
-    # часто формулируют заголовок про одно и то же событие совершенно
-    # по-разному ("вернулся для восстановления" / "вернулся после ЧМ"),
-    # из-за чего похожая новость проходила как "новая". Слова из summary
-    # (имена, цифры, места) обычно совпадают гораздо надёжнее, чем слова
-    # в заголовке — добавляем их в сравнение.
     return significant_title_words(title) | significant_words(summary)
 
 
-# УРОВЕНЬ B дедупа (без ИИ, бесплатно): "именные" стемы — слова с
-# заглавной буквы не в начале фразы почти всегда имена/топонимы
-# ("Эльбрус", "Одесса"), а не случайное слово. Если у двух новостей
-# совпадает такой стем — это гораздо более сильный сигнал одного
-# события, чем совпадение обычных слов ("погиб", "человек" и т.п.),
-# и позволяет распознать дубль даже при низком общем словесном
-# перекрытии (см. кейс "эвакуированы тела" / "погibли двое альпинистов"
-# на Эльбрусе — общих слов мало, но оба содержат "Эльбрус").
-# ИСТОРИЯ ФИКСОВ: сначала сюда пытались добавить "Трамп"/"Германия"/
-# "Берлин" статически и навсегда, потому что их частое появление приводило
-# к тому, что почти любая пара новостей с упоминанием, например, Трампа
-# считалась "тем же событием" — из-за чего целый прогон однажды отбросил
-# ВСЕ 68 кандидатов пула как дубли. Но постоянный бан оказался слишком
-# грубым: он же выключал полезную функцию "🔄 Продолжение истории" именно
-# для горячих тем (например, для реально развивающегося теракта в
-# Берлине) — где связывать посты как раз важнее всего. Поэтому здесь
-# остаются только слова, фоновые ВСЕГДА, а не временно; актуальные
-# "горячие" имена ловит ДИНАМИЧЕСКИЙ механизм ниже
-# (compute_common_entity_stems) — он подстраивается сам, пока тема
-# остаётся частой, и сам же перестаёт исключать имя, когда она остывает.
 COMMON_ENTITY_STOPWORD_STEMS = {
-    # ФИКС (обратный откат части вчерашнего): "герман"/"берлин" и другие
-    # geo/political имена держать здесь ПОСТОЯННО было ошибкой — Берлин
-    # прямо сейчас в центре реально развивающейся истории (теракт), и
-    # из-за постоянного бана функция "🔄 Продолжение истории" перестала
-    # связывать посты именно там, где это нужнее всего. Здесь оставляем
-    # только слова, которые фоновые ВСЕГДА, а не временно — актуальные
-    # "горячие" имена (Трамп, Берлин и т.п.) пусть ловит ДИНАМИЧЕСКИЙ
-    # механизм ниже (compute_common_entity_stems), который сам понимает,
-    # когда конкретное имя стало слишком частым, и сам же перестаёт его
-    # исключать, когда тема остывает — в отличие от постоянного списка.
     "росси", "москв", "украи", "путин", "минюс", "госдум", "кремл",
     "россия", "мчс", "мвд", "фсб", "цб",
 }
@@ -568,15 +464,6 @@ def extract_entity_stems(text):
 
 
 def compute_common_entity_stems(recent_posts, min_count=5, max_fraction=0.15):
-    # РАДИКАЛЬНЫЙ ФИКС: вместо того чтобы вручную и бесконечно пополнять
-    # статический список "слишком общих" имён (что мы уже дважды делали —
-    # для "ии" и для "гол"/"лига", теперь для "Трамп"/"Германия"), считаем
-    # частоту каждого именного стема по РЕАЛЬНОЙ недавней истории постов.
-    # Стем, который встречается больше чем в max_fraction всех недавних
-    # постов (и не реже min_count раз), считается "фоновым словом", а не
-    # уникальным идентификатором конкретного события, и исключается из
-    # сравнения — это адаптируется само по себе к любой новой часто
-    # повторяющейся теме, а не только к тем именам, что мы уже заметили.
     if not recent_posts:
         return set()
     counter = {}
@@ -590,11 +477,6 @@ def compute_common_entity_stems(recent_posts, min_count=5, max_fraction=0.15):
 
 
 def titles_are_similar(words_a, words_b, threshold=0.5):
-    # Коэффициент перекрытия: общие слова / слова в БОЛЕЕ КОРОТКОМ наборе —
-    # если меньший набор почти целиком содержится в большем, речь об одном
-    # и том же факте. Порог снижен с 0.6 до 0.5 после перехода на
-    # title+summary (наборы слов стали крупнее, и полезный сигнал
-    # разбавляется словами, не относящимися к сути события).
     if not words_a or not words_b:
         return False
     smaller = min(len(words_a), len(words_b))
@@ -604,14 +486,6 @@ def titles_are_similar(words_a, words_b, threshold=0.5):
 
 
 def is_same_event(title_a, summary_a, title_b, summary_b, exclude_entities=None):
-    # Комбинированная проверка: сначала обычный порог (0.5), а если он не
-    # пройден — смотрим, есть ли общий именной стем (см. выше); если да,
-    # порог резко снижается (0.15), потому что совпадение конкретного
-    # места/персоны — уже само по себе сильное доказательство того же
-    # события, даже если остальные слова текста совсем разные.
-    # exclude_entities — стемы, которые слишком часто встречаются в
-    # недавней истории (см. compute_common_entity_stems), чтобы считаться
-    # уникальным признаком конкретного события — их не учитываем.
     words_a = content_words(title_a, summary_a)
     words_b = content_words(title_b, summary_b)
     if titles_are_similar(words_a, words_b, threshold=0.5):
@@ -650,16 +524,8 @@ def is_duplicate_by_meaning(words, recent_word_sets):
     return any(titles_are_similar(words, other) for other in recent_word_sets)
 
 
-# УРОВЕНЬ B/C дедупа: раньше "память" дедупа хранила только наборы слов
-# (без исходного текста), поэтому не было возможности сравнить именные
-# стемы или спросить ИИ про смысл — приходилось восстанавливать текст
-# из ничего. Теперь дополнительно храним сам текст (заголовок + начало
-# тела) последних опубликованных постов — это даёт материал и для
-# entity-проверки, и для смысловой проверки через GigaChat.
 RECENT_POSTS_FILE = "recent_posts.json"
-RECENT_POSTS_LIMIT = 300  # было 30 — увеличено, чтобы (а) дедуп уровня B/C
-                          # видел более длинную историю и (б) было из чего
-                          # собирать еженедельный рекап "Главное за неделю"
+RECENT_POSTS_LIMIT = 300
 
 
 def load_recent_posts():
@@ -673,8 +539,6 @@ def save_recent_posts(posts):
 
 
 def is_duplicate_word_or_entity(candidate_title, candidate_summary, recent_posts, exclude_entities=None):
-    # Уровень B применительно к реально опубликованным постам (не только
-    # к текущему пулу кандидатов) — без вызова ИИ, бесплатно и мгновенно.
     for post in recent_posts:
         if is_same_event(candidate_title, candidate_summary,
                           post.get("headline", ""), post.get("summary", ""),
@@ -688,15 +552,6 @@ STORY_CONTINUATION_WINDOW_HOURS = 48
 
 def find_story_continuation(candidate_title, candidate_summary, recent_posts,
                              hours=STORY_CONTINUATION_WINDOW_HOURS, exclude_entities=None):
-    # "Продолжение истории": кандидат уже ПРОШЁЛ проверку на дубликат (иначе
-    # его бы не публиковали вовсе) — эта функция не про дедуп, а про то,
-    # чтобы связать НОВУЮ, но связанную новость с предыдущим постом на ту же
-    # тему/место/персону (общий именной стем), опубликованным недавно.
-    # Ищем самое СВЕЖЕЕ совпадение — если их несколько, ссылаемся на
-    # последний пост по теме, а не на самый первый.
-    # exclude_entities — см. compute_common_entity_stems: без этого
-    # "Трамп"/"Германия" и т.п. связывали бы совершенно не связанные
-    # новости пометкой "продолжение истории".
     exclude_entities = exclude_entities or set()
     c_entities = (extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)) - exclude_entities
     if not c_entities:
@@ -711,26 +566,13 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
             continue
         p_entities = (extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))) - exclude_entities
         if c_entities & p_entities:
-            best = post  # recent_posts в порядке добавления — последнее совпадение самое свежее
+            best = post
     return best
 
 
-# --- "Крутая" фича: живая трансляция развивающегося события ---
-# Вместо серии разрозненных постов об одном теракте/происшествии — ОДНО
-# закреплённое сообщение, которое бот сам редактирует (editMessageText)
-# по мере поступления новых деталей, как live-блог у крупных изданий.
-# Полноценной непрерывной трансляции без постоянно работающего сервера
-# не сделать (GitHub Actions — это периодические запуски, а не процесс
-# 24/7), но между запусками разница обычно секунды-минуты, и для
-# читателя это выглядит как живое обновление одного и того же поста.
-# Намеренное ограничение: одновременно ведётся только ОДНА живая
-# трансляция — так проще гарантировать, что ничего не потеряется и не
-# перепутается между параллельными сюжетами.
 LIVE_STORIES_FILE = "live_stories.json"
-LIVE_STORY_MAX_AGE_HOURS = 12   # трансляция считается завершённой, если
-                                 # обновлений не было дольше этого времени
-LIVE_STORY_MAX_UPDATES = 15     # старые обновления обрезаются, чтобы не
-                                 # упереться в лимит длины сообщения Telegram
+LIVE_STORY_MAX_AGE_HOURS = 12
+LIVE_STORY_MAX_UPDATES = 15
 
 
 def load_live_threads():
@@ -750,7 +592,7 @@ def find_active_live_thread(candidate_title, candidate_summary, threads, exclude
         return None
     for thread in threads:
         if now - thread.get("last_update_ts", 0) > LIVE_STORY_MAX_AGE_HOURS * 3600:
-            continue  # трансляция "остыла" — считаем её завершённой
+            continue
         t_entities = set(thread.get("entities", [])) - exclude_entities
         if c_entities & t_entities:
             return thread
@@ -803,9 +645,6 @@ def edit_message_text(message_id, text):
         }, timeout=10)
         data = resp.json()
         if not data.get("ok"):
-            # "message is not modified" — не ошибка, а идемпотентность;
-            # остальное — реальная проблема (например, пост слишком старый
-            # для редактирования, Telegram лимитирует правки старше 48ч).
             if "not modified" not in str(data.get("description", "")):
                 print(f"[WARN] editMessageText failed: {data}")
             return "not modified" in str(data.get("description", ""))
@@ -837,24 +676,15 @@ def append_live_update(thread, item):
         "time": now_msk_time,
         "text": item.get("body") or item.get("title", ""),
     }]
-    # Новые упомянутые имена тоже добавляем — сюжет мог "прирасти" новыми
-    # действующими лицами по ходу развития (например, назвали подозреваемого).
     new_entities = extract_entity_stems(item["title"]) | extract_entity_stems(item.get("summary", ""))
     thread["entities"] = list(set(thread.get("entities", [])) | new_entities)
     return thread
 
 
-MAX_AI_DEDUPE_CHECKS = 5  # ограничиваем число вызовов ИИ на дедуп за один запуск
+MAX_AI_DEDUPE_CHECKS = 5
 
 
 def check_semantic_duplicate_via_ai(candidate_title, candidate_summary, recent_posts):
-    # УРОВЕНЬ C (радикальный): если словарная проверка и проверка по
-    # именным стемам не нашли дубль, но новость всё равно может
-    # описывать то же самое событие совершенно другими словами (разный
-    # акцент: "эвакуировали тела" vs "погибли на восхождении") — это
-    # единственный способ поймать такой случай: спросить сам GigaChat.
-    # Дороже по времени/токенам, поэтому вызывается только для реально
-    # выбранного кандидата перед отправкой, а не для всего пула.
     token = get_gigachat_token()
     if not token or not recent_posts:
         return None
@@ -995,9 +825,6 @@ def rewrite_with_ai(title, summary):
         time.sleep(AI_CALL_DELAY)
 
         headline_match = re.search(r"ЗАГОЛОВОК:\s*(.+)", answer)
-        # ФИКС: без нелчадности (?=...) старый regex с re.S жадно захватывал
-        # ВСЁ до конца строки, включая последующую строку КОНТЕКСТ: — теперь
-        # текст останавливается перед меткой КОНТЕКСТ: или концом ответа.
         body_match = re.search(r"ТЕКСТ:\s*(.+?)(?=\n\s*КОНТЕКСТ:|\Z)", answer, re.S)
         context_match = re.search(r"КОНТЕКСТ:\s*(.+)", answer)
         if headline_match and body_match:
@@ -1048,16 +875,6 @@ def fetch_telegram_channel(username, limit=20):
         first_line = raw_text.split("\n")[0].strip()
         title = first_line[:200] if first_line else raw_text[:200]
 
-        # ФИКС: раньше переносы строк просто схлопывались в пробел —
-        # если исходный пост оформлен как "лид-строка\nосновной текст"
-        # БЕЗ точки в конце строки (частый стиль в новостных каналах),
-        # два предложения сливались в одно без разделителя ("...
-        # подозреваемых Инцидент произошел..."). Из-за этого весь
-        # последующий разбор по предложениям (лимит для срочных постов,
-        # дедуп по словам) ломался именно на этом стыке. Теперь при
-        # склейке строк добавляем точку, если строка ещё не заканчивается
-        # знаком препинания — это восстанавливает границу предложения,
-        # которая была потеряна при вёрстке исходного поста.
         raw_lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
         joined_parts = []
         for line in raw_lines:
@@ -1110,10 +927,6 @@ def fetch_news():
     recent_content_words = load_recent_title_words()
     new_items = []
     seen_title_keys = set()
-    # Признак 6/9: список содержит и слова, и источник, и индекс в
-    # new_items — нужен, чтобы при встрече похожей новости от ДРУГОГО
-    # канала не просто отбросить дубль, а пометить уже сохранённый
-    # оригинал как «подтверждено несколькими источниками».
     seen_items_meta = []
 
     if not os.path.exists(FEEDS_FILE):
@@ -1146,10 +959,6 @@ def fetch_news():
             if title_key in posted or title_key in seen_title_keys:
                 continue
 
-            # Признак 8: защита от обрубленных заголовков — если в
-            # заголовке меньше 3 значимых слов, это почти всегда обрывок
-            # текста (например, канал разбил пост на несколько строк, а
-            # мы забрали только первую), публиковать такое нельзя.
             if len(significant_title_words(title)) < 3:
                 continue
 
@@ -1158,10 +967,6 @@ def fetch_news():
             link = entry.get("link", "")
             source_channel = entry.get("source_channel") or ""
 
-            # ФИКС: сравниваем по словам заголовка + summary вместе (не
-            # только заголовка), потому что разные каналы часто по-разному
-            # формулируют заголовок про одно и то же событие, а факты в
-            # тексте (summary) обычно совпадают.
             c_words = content_words(title, summary)
             if is_duplicate_by_meaning(c_words, recent_content_words):
                 continue
@@ -1169,24 +974,29 @@ def fetch_news():
             dup_meta = next((m for m in seen_items_meta if titles_are_similar(c_words, m["words"])), None)
             if dup_meta is not None:
                 if dup_meta["source_channel"] != source_channel:
-                    # Другой канал независимо сообщает о том же событии —
-                    # не публикуем второй раз, но помечаем оригинал как
-                    # подтверждённый несколькими источниками.
                     new_items[dup_meta["idx"]]["confirmed_multi_source"] = True
                 continue
 
             if is_not_news(title, summary):
                 continue
 
+            # ФИКС (найдено при разборе жалобы "давно нет новостей"): раньше
+            # ЛЮБАЯ новость без фото/видео отбрасывалась безусловно — в том
+            # числе СРОЧНАЯ (is_urgent), хотя срочные алерты у источников
+            # почти всегда текстовые (эвакуация/теракт/ЧС публикуются раньше,
+            # чем появляется фото с места). Из-за этого бот мог полностью
+            # "молчать" часами, если у всех источников в моменте не оказалось
+            # ни одной новости с медиа, даже когда реальные срочные события
+            # были. Срочные новости больше не требуют фото/видео.
+            urgent = is_urgent(title, summary)
             photo = entry.get("photo")
             photo_bytes = entry.get("photo_bytes")
             video = entry.get("video")
-            if not photo and not video:
+            if not photo and not video and not urgent:
                 continue
 
             src = f"@{source_channel}" if source_channel else source_name(link)
-            urgent = is_urgent(title, summary)
-            print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}")
+            print(f"[INFO] '{title[:50]}' ({src}) — photo={'yes' if photo else 'no'}, video={'yes' if video else 'no'}, urgent={urgent}")
 
             new_items.append({
                 "id": entry_id,
@@ -1215,9 +1025,6 @@ def fetch_news():
 
 
 def split_long_sentences(text, max_words=25):
-    # Признак: слишком длинное предложение (>25 слов) читается тяжело —
-    # разбиваем по ближайшей запятой к середине, если такая есть, иначе
-    # оставляем как есть (лучше длинное предложение, чем испорченный смысл).
     if not text:
         return text
     sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
@@ -1245,8 +1052,6 @@ def split_long_sentences(text, max_words=25):
 
 
 def paragraphize(text, sentences_per_para=2):
-    # Признак топ-каналов: короткие абзацы (1-2 предложения), а не
-    # сплошной блок текста — читается заметно быстрее с телефона.
     if not text:
         return text
     sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
@@ -1269,17 +1074,12 @@ def finalize_item(item):
         headline_raw = sentences[0] if sentences else item["title"]
         body_raw = " ".join(sentences[1:MAX_SENTENCES + 1])
 
-    # Признаки 3/4/5/7: убираем decorative-эмодзи от AI, клише-вставки,
-    # КАПС и повторяющуюся пунктуацию — до экранирования HTML и до обрезки.
     headline_raw = fix_shouty_caps(strip_cliche_openers(sanitize_text(headline_raw)))
     body_raw = split_long_sentences(strip_cliche_openers(sanitize_text(body_raw)))
 
     item["headline"] = html.escape(truncate_at_word(headline_raw)) if headline_raw else html.escape(truncate_at_word(item["title"]))
 
     if item.get("urgent"):
-        # Признак «молния»: срочная новость — коротко и без разбивки на
-        # абзацы (1-2 предложения), как экстренный формат у РИА/ТАСС —
-        # читатель должен понять суть за секунду, без прокрутки.
         urgent_body = limit_sentences(body_raw, max_sentences=2)
         item["body"] = html.escape(urgent_body) if urgent_body else ""
     else:
@@ -1287,19 +1087,11 @@ def finalize_item(item):
 
     item["category"] = detect_category(item["title"], item.get("summary", ""))
 
-    # Признак 5: короткая атрибуция источника в конце поста — просто
-    # @handle канала-первоисточника, без ссылки и без цитирования текста.
-    # "Крутая фишка": для приоритетного источника (ТАСС) атрибуция
-    # дополняется меткой доверия — читатель сразу видит, что это
-    # официальное агентство, а не рядовой агрегатор.
     if item.get("source_channel") == TASS_CHANNEL:
         item["attribution"] = f"📡 {item.get('source', '')} — приоритетный источник"
     else:
         item["attribution"] = item.get("source") if item.get("source_channel") else None
 
-    # "Почему это важно" — контекстная строка от AI (см. rewrite_with_ai).
-    # Только для НЕсрочных постов: у срочных и так формат-"молния", лишняя
-    # строка там мешает мгновенному считыванию сути.
     context_raw = rewritten.get("context") if rewritten else None
     if context_raw and not item.get("urgent"):
         context_raw = fix_shouty_caps(strip_cliche_openers(sanitize_text(context_raw)))
@@ -1349,21 +1141,6 @@ def pick_featured_index(items):
 
 
 def pick_non_duplicate(items):
-    # ФИКС (защита от гонки между запусками): к моменту, когда мы
-    # действительно готовы отправлять пост, могло пройти время — например,
-    # только что отработал дайджест и опубликовал что-то очень похожее на
-    # нашего кандидата. Перечитываем posted/recent прямо перед отправкой и
-    # берём первого кандидата, который всё ещё не дубликат.
-    #
-    # РАДИКАЛЬНЫЙ ФИКС (3 уровня, от дешёвого к дорогому):
-    #   A. точный хэш заголовка / пересечение словарных стемов (было)
-    #   B. пересечение "именных" стемов (Эльбрус, Одесса...) с более
-    #      низким порогом — ловит одно событие, описанное разными
-    #      словами, но упомянувшее общее место/персону
-    #   C. смысловая проверка через GigaChat против РЕАЛЬНО
-    #      опубликованных постов (а не только текущего пула) — ловит
-    #      случаи, когда даже общих именных стемов нет, но по смыслу
-    #      это то же самое событие
     posted_now = load_posted()
     recent_now = load_recent_title_words()
     recent_posts_now = load_recent_posts()
@@ -1392,11 +1169,6 @@ def pick_non_duplicate(items):
 
 
 def send_to_telegram(text):
-    # ФИКС/расширение: возвращает message_id (число) при успехе вместо
-    # True, или None при неудаче — вызовы вида "if send_to_telegram(...)"
-    # продолжают работать как раньше (число истинно, None ложно), но
-    # теперь можно сохранить message_id для построения ссылки на пост
-    # (нужно для "🔄 Продолжение истории").
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("[ERROR] Telegram credentials missing.")
         return None
@@ -1413,7 +1185,7 @@ def send_to_telegram(text):
             try:
                 return resp.json().get("result", {}).get("message_id")
             except Exception:
-                return True  # отправилось, но не смогли распарсить id — не считаем ошибкой
+                return True
         else:
             print(f"[ERROR] Telegram send failed: {resp.text}")
             return None
@@ -1501,9 +1273,6 @@ def send_post(item, text):
 
 
 def format_post(item, extra=""):
-    # Срочная новость — обычный "срочный" эмодзи-акцент, как раньше.
-    # Иначе — категорийный маркер (⚽️/🚨/💹/🏛/💻) вместо статичного 🔷,
-    # плюс хэштег категории в конце поста, если категория распознана.
     category_emoji, hashtag = item.get("category", (CHANNEL_MARK, None))
     if item.get("urgent"):
         mark = random.choice(URGENT_EMOJIS)
@@ -1511,11 +1280,6 @@ def format_post(item, extra=""):
         mark = category_emoji
     text = f"{mark} <b>{item['headline']}</b>"
 
-    # "🔄 Продолжение истории" — если новость связана с недавним постом на
-    # ту же тему (общее место/персона), но не является его дубликатом
-    # (иначе была бы отфильтрована раньше) — даём читателю ссылку на
-    # предыдущий пост, чтобы он видел развитие сюжета, а не разрозненные
-    # посты об одном и том же.
     continuation = item.get("continuation_of")
     if continuation and continuation.get("message_id"):
         link = f"https://t.me/{CHANNEL_USERNAME}/{continuation['message_id']}"
@@ -1524,15 +1288,9 @@ def format_post(item, extra=""):
     if item.get("body"):
         text += f"\n\n{item['body']}"
 
-    # "Почему это важно" — короткая контекстная строка от AI, не пересказ,
-    # а объяснение значимости/следствия. Только если AI реально нашёл, что
-    # сказать (rewrite_with_ai возвращает None, если добавить нечего).
     if item.get("context_line"):
         text += f"\n\n💡 {item['context_line']}"
 
-    # Признак 6: если новость независимо подтвердили 2+ разных канала в
-    # пуле кандидатов — это реальный сигнал достоверности, как у крупных
-    # агентств, которые не публикуют неподтверждённые вбросы одного канала.
     if item.get("confirmed_multi_source"):
         text += "\n\n✅ Подтверждено несколькими источниками"
 
@@ -1541,9 +1299,6 @@ def format_post(item, extra=""):
     if hashtag and not item.get("urgent"):
         text += f"\n\n{hashtag}"
 
-    # Признак 5: короткая атрибуция первоисточника — без ссылки, без
-    # цитирования текста, просто @handle канала (не нарушает копирайт,
-    # но повышает прозрачность/доверие).
     if item.get("attribution"):
         text += f"\n\n{html.escape(item['attribution'])}"
 
@@ -1619,9 +1374,6 @@ def now_msk():
 
 
 def send_admin_alert(text):
-    # Признак 3: короткое уведомление в личный/служебный чат админа —
-    # НЕ в новостной канал, чтобы не засорять его системными сообщениями.
-    # Если ADMIN_CHAT_ID не задан, просто логируем — работа бота не рвётся.
     if not TELEGRAM_TOKEN:
         return False
     if not ADMIN_CHAT_ID:
@@ -1637,11 +1389,6 @@ def send_admin_alert(text):
 
 
 def check_silence_alert(elapsed):
-    # Признак 3: если публикаций не было дольше SILENCE_ALERT_HOURS —
-    # шлём алерт админу, но не чаще раза в сутки. ВАЖНО: не пишем
-    # ALERT_STATE_FILE здесь напрямую — persist_state_to_git делает
-    # git reset --hard перед коммитом и стёр бы эту запись. Вместо этого
-    # возвращаем новую метку времени, чтобы main() передал её в persist.
     if elapsed is None or elapsed < SILENCE_ALERT_HOURS * 3600:
         return None
     alert_state = _load_json(ALERT_STATE_FILE, {"last_alert": 0})
@@ -1656,12 +1403,6 @@ def check_silence_alert(elapsed):
     return None
 
 
-# --- Пункт 6: "скорость как метрика доверия" ---
-# Время между появлением новости у источника (Telegram-канала) и
-# публикацией у нас. Не выводится в сами посты (это было бы навязчиво),
-# а копится в отдельном файле и попадает в status.json — как внутренняя
-# аналитика, которую можно использовать хоть в закреплённом сообщении,
-# хоть просто чтобы знать, насколько оперативно работает бот.
 SPEED_STATS_FILE = "speed_stats.json"
 SPEED_STATS_LIMIT = 200
 
@@ -1678,8 +1419,6 @@ def parse_source_published(published_str):
     if not published_str:
         return None
     try:
-        # Формат из Telegram (<time datetime="...">) — ISO 8601, иногда с
-        # суффиксом 'Z' вместо явного смещения таймзоны.
         s = published_str.replace("Z", "+00:00")
         return datetime.fromisoformat(s).timestamp()
     except Exception:
@@ -1692,9 +1431,6 @@ def compute_publish_latency_seconds(source_published_str, publish_time=None):
         return None
     publish_time = publish_time if publish_time is not None else time.time()
     latency = publish_time - src_ts
-    # Отбрасываем заведомо некорректные значения: отрицательные (разъехались
-    # часовые пояса при парсинге) или больше суток (источник явно не "живой",
-    # смысла считать это скоростью публикации нет).
     if latency < 0 or latency > 24 * 3600:
         return None
     return latency
@@ -1719,10 +1455,6 @@ def speed_stats_summary(samples):
 
 
 def source_contribution_summary(recent_posts):
-    # Признак: сколько реально ОПУБЛИКОВАННЫХ (не просто увиденных) постов
-    # дал каждый источник за время, что хранится в recent_posts.json.
-    # Нужно для того, чтобы решать, какие каналы из feeds.txt сокращать,
-    # по фактическим данным — а не гадая по одним названиям.
     counts = {}
     for post in recent_posts:
         src = post.get("source") or "неизвестно"
@@ -1730,45 +1462,24 @@ def source_contribution_summary(recent_posts):
     return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
 
 
-# --- Приоритет источников и категорий по запросу пользователя ---
-# Пользователь задал: (1) приоритетные категории — Политика, Финансы,
-# СВО, Москва, Происшествия, Спорт; (2) ТАСС — главный источник с целевой
-# долей публикаций ~30%, остальное — пропорционально.
-#
-# "30%" — это ЦЕЛЬ ДЛЯ ДИСТАНЦИИ МНОГИХ ПУБЛИКАЦИЙ, не гарантия для
-# каждого отдельного поста (за один запуск публикуется 1 новость, точную
-# долю физически невозможно выдержать на каждом шаге). Поэтому вместо
-# фиксированного множителя вес ТАСС считается САМОКОРРЕКТИРУЮЩИМСЯ: берём
-# реальную статистику по уже ОПУБЛИКОВАННЫМ постам (source_contribution_
-# summary, который мы уже вели) — если ТАСС в последнее время публикуется
-# РЕЖЕ 30% — его вес при выборе растёт; если ЧАЩЕ — вес падает. Система
-# сама тянется к цели, а не полагается на угаданную константу.
 PRIORITY_CATEGORY_TAGS = {
     "#политика", "#экономика", "#сво", "#москва", "#происшествия", "#спорт",
 }
 TASS_CHANNEL = "tass_agency"
 TARGET_TASS_SHARE = 0.30
-PRIORITY_CATEGORY_BONUS = 1.5  # прибавка к весу за попадание в приоритетную категорию
+PRIORITY_CATEGORY_BONUS = 1.5
 
 
 def compute_tass_weight_multiplier(recent_posts, min_sample=5):
     contribution = source_contribution_summary(recent_posts)
     total = sum(contribution.values())
     if total < min_sample:
-        # Данных мало (например, только запустили бота) — стартуем с
-        # заметного, но не экстремального множителя, чтобы не начинать
-        # с перекоса, пока статистика не накопилась.
         return 2.0
     tass_count = contribution.get(f"@{TASS_CHANNEL}", 0)
     current_share = tass_count / total
     if current_share >= TARGET_TASS_SHARE:
-        # ТАСС уже на целевой доле или выше — не поднимаем вес искусственно,
-        # но и не наказываем: другим источникам просто дают равные шансы.
         return 1.0
     deficit = TARGET_TASS_SHARE - current_share
-    # Чем сильнее фактическая доля отстаёт от цели, тем выше множитель —
-    # линейная чувствительность с разумным потолком, чтобы не превращать
-    # выбор в гарантированный "всегда ТАСС" даже при большом отставании.
     return min(1.0 + deficit * 12, 5.0)
 
 
@@ -1783,10 +1494,6 @@ def compute_candidate_priority_weight(item, tass_multiplier):
 
 
 def order_candidates_by_priority(items, recent_posts):
-    # Детерминированная сортировка по убыванию веса — так результат
-    # предсказуем и проверяем тестами, в отличие от случайного выбора.
-    # На дистанции многих запусков это и даёт нужный перекос в сторону
-    # ТАСС и приоритетных категорий, не будучи "лотереей" на каждом шаге.
     if not items:
         return []
     tass_multiplier = compute_tass_weight_multiplier(recent_posts)
@@ -1796,8 +1503,6 @@ def order_candidates_by_priority(items, recent_posts):
 
 
 def build_status_snapshot(last_publish_elapsed, sent_count=None, note=""):
-    # Признак 4: снимок состояния для внешнего мониторинга (например,
-    # UptimeRobot может проверять поле "healthy" в сыром файле status.json).
     speed = speed_stats_summary(load_speed_stats())
     return {
         "last_check": datetime.utcnow().isoformat(),
@@ -1859,15 +1564,7 @@ def send_poll_to_telegram(question, options):
         return False
 
 
-# --- "Крутая" фича: ежедневный квиз по РЕАЛЬНЫМ опубликованным новостям ---
-# Использует нативный Quiz Poll в Telegram (type="quiz") — Telegram сам
-# подсвечивает правильный ответ и показывает объяснение всем, кто
-# проголосовал, сразу после голосования. Это не отдельная вручную
-# написанная механика, а встроенный формат самого Telegram, которым
-# редко пользуются небольшие каналы. Вопрос строится строго по фактам
-# уже опубликованного поста — никакие новости не выдумываются, квиз
-# только проверяет внимательность к тому, что реально было в канале.
-QUIZ_TIME = "15:00"  # МСК
+QUIZ_TIME = "15:00"
 QUIZ_WINDOW_MINUTES = DIGEST_WINDOW_MINUTES
 QUIZ_STATE_FILE = "quiz_state.json"
 QUIZ_LOOKBACK_HOURS = 24
@@ -1883,9 +1580,6 @@ def due_quiz(dt, already_sent_today):
 
 
 def pick_quiz_source_post(recent_posts, hours=QUIZ_LOOKBACK_HOURS):
-    # Берём пост за последние сутки с достаточно содержательным текстом
-    # (короткие/технические записи не дают материала для вопроса) —
-    # предпочитаем самый свежий подходящий, чтобы квиз был об актуальном.
     now = time.time()
     candidates = [
         p for p in recent_posts
@@ -1896,9 +1590,6 @@ def pick_quiz_source_post(recent_posts, hours=QUIZ_LOOKBACK_HOURS):
 
 
 def build_quiz_from_post(post):
-    # Просим GigaChat сформулировать вопрос СТРОГО по фактам из текста
-    # поста — с одним верным и тремя правдоподобными неверными вариантами,
-    # плюс короткое объяснение (Telegram покажет его после ответа).
     token = get_gigachat_token()
     if not token or not post:
         return None
@@ -1938,8 +1629,6 @@ def build_quiz_from_post(post):
         options = [str(o).strip() for o in data.get("options", [])]
         correct_index = data.get("correct_index")
         explanation = str(data.get("explanation", "")).strip()
-        # Валидация: ровно 4 варианта, корректный индекс, вопрос и варианты
-        # укладываются в лимиты самого Telegram (question ≤300, option ≤100).
         if (not question or len(options) != 4 or not isinstance(correct_index, int)
                 or not (0 <= correct_index < 4) or any(not o for o in options)):
             return None
@@ -1982,9 +1671,8 @@ def send_quiz_poll(quiz):
         return False
 
 
-# --- Еженедельный рекап "Главное за неделю" ---
-WEEKLY_RECAP_WEEKDAY = 6         # 0=понедельник ... 6=воскресенье (МСК)
-WEEKLY_RECAP_TIME = "20:00"      # МСК
+WEEKLY_RECAP_WEEKDAY = 6
+WEEKLY_RECAP_TIME = "20:00"
 WEEKLY_RECAP_WINDOW_MINUTES = 4
 WEEKLY_RECAP_STATE_FILE = "weekly_recap_state.json"
 WEEKLY_RECAP_MAX_ITEMS = 7
@@ -2007,14 +1695,11 @@ def due_weekly_recap(dt, current_week_key, state):
 
 
 def pick_weekly_recap_items(recent_posts, max_items=WEEKLY_RECAP_MAX_ITEMS):
-    # Берём посты за последние 7 дней (по ts, если он есть — старые записи
-    # без ts, оставшиеся от версии до этого фикса, просто не отфильтровываем
-    # агрессивно, чтобы не остаться совсем без материала первую неделю).
     now = time.time()
     week_posts = [p for p in recent_posts if not p.get("ts") or now - p["ts"] <= 7 * 24 * 3600]
     if not week_posts:
         week_posts = recent_posts
-    candidates = week_posts[-100:]  # ограничиваем размер промпта разумным пределом
+    candidates = week_posts[-100:]
     if not candidates:
         return []
     if len(candidates) <= max_items:
@@ -2071,8 +1756,6 @@ def format_weekly_recap(items):
 def format_digest(items, slot_label):
     lines = [f"{CHANNEL_MARK} <b>{slot_label}</b>", ""]
     for i, it in enumerate(items, 1):
-        # Признак 7: категорийный эмодзи и в дайджесте, не только в
-        # одиночных постах — единообразие визуального языка канала.
         cat_emoji, _ = it.get("category", (CHANNEL_MARK, None))
         lines.append(f"{i}. {cat_emoji} <b>{it['headline']}</b>")
         if it.get("body"):
@@ -2107,28 +1790,16 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                           new_alert_timestamp=None, new_status=None, new_weekly_recap_state=None,
                           new_quiz_state=None):
     if os.environ.get("GITHUB_ACTIONS") != "true":
-        return
+        return True
     import subprocess
 
     new_posted_ids = new_posted_ids or []
-    # ФИКС: раньше сюда передавался только ОДИН набор слов (от одиночного
-    # поста), а дайджест вообще ничего не передавал. Теперь это список
-    # наборов слов — по одному на каждый реально отправленный пост, включая
-    # все элементы дайджеста.
     new_title_words_list = new_title_words_list or []
 
     try:
         subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
         subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
 
-        # ФИКС: было всего 3 попытки с фиксированной паузой 2 сек — этого
-        # мало для транзиентных конфликтов git push. Если все попытки
-        # проваливались, пост уже уходил в Telegram, а запись о нём в
-        # posted.json так и не попадала в git — следующий запуск не знал
-        # о публикации и мог отправить ту же новость повторно (см.
-        # скриншот с дублем СУ-34 от РИА Новости). Увеличиваем число
-        # попыток и делаем паузу растущей + со случайным джиттером, чтобы
-        # конфликтующие процессы не сталкивались раз за разом синхронно.
         MAX_PUSH_ATTEMPTS = 8
         for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
             fetch = subprocess.run(["git", "fetch", "origin", "main"], capture_output=True, text=True)
@@ -2169,11 +1840,6 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             local_milestone = load_last_milestone()
             merged_milestones = {"last": max(remote_milestones.get("last", 0), local_milestone)}
 
-            # recent_posts.json уже дописан локально (main() вызывает
-            # save_recent_posts до persist_state_to_git) — читаем его
-            # ДО git reset --hard, точно так же, как local_milestone выше,
-            # и мёржим с версией из origin/main по ключу (headline, summary),
-            # чтобы не потерять записи, добавленные другим успевшим запуском.
             local_recent_posts = load_recent_posts()
             seen_keys = set()
             merged_recent_posts = []
@@ -2187,18 +1853,9 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 merged_recent_posts.append(post)
             merged_recent_posts = merged_recent_posts[-RECENT_POSTS_LIMIT:]
 
-            # speed_stats.json — та же логика: локальный файл уже дописан
-            # до reset --hard, просто конкатенируем с origin/main и
-            # обрезаем до лимита. Мягкая аналитика, не критичная для
-            # дедупа — точный дедуп записей здесь не нужен.
             local_speed_stats = load_speed_stats()
             merged_speed_stats = (list(remote_speed_stats) + local_speed_stats)[-SPEED_STATS_LIMIT:]
 
-            # live_stories.json — мёржим по message_id, оставляя для каждого
-            # треда версию с более свежим last_update_ts (та, что "видела"
-            # больше обновлений), и сразу отбрасываем остывшие трансляции
-            # (без обновлений дольше LIVE_STORY_MAX_AGE_HOURS), чтобы файл
-            # не рос бесконечно завершёнными сюжетами.
             local_live_threads = load_live_threads()
             by_message_id = {}
             for t in (list(remote_live_threads) + local_live_threads):
@@ -2213,10 +1870,26 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 if _now_ts - t.get("last_update_ts", 0) <= LIVE_STORY_MAX_AGE_HOURS * 3600
             ]
 
-            merged_digest = new_digest_state if new_digest_state is not None else remote_digest
-            merged_poll = new_poll_state if new_poll_state is not None else remote_poll
-            merged_quiz = new_quiz_state if new_quiz_state is not None else remote_quiz
-            merged_weekly_recap = new_weekly_recap_state if new_weekly_recap_state is not None else remote_weekly_recap
+            # ФИКС: раньше "новое" состояние опроса/квиза/дайджеста/рекапа
+            # просто ПЕРЕЗАПИСЫВАЛО remote-версию целиком (new_* или remote_*
+            # целиком, без слияния). Если два запуска почти одновременно
+            # решили, что опрос "нужно отправить" (см. MIN_*_GAP_SECONDS
+            # выше — теперь это отдельная защита), при пуше более позднего
+            # из них он просто перетирал remote своим "sent": True — то есть
+            # само по себе перезаписывание не было причиной дубликата, но
+            # мёржим по last_sent_ts (берём максимум), чтобы гонка попыток
+            # пуша не могла откатить уже более свежую метку отправки назад.
+            def _merge_daily_state(remote, new, ts_key="last_sent_ts"):
+                if new is None:
+                    return remote
+                if remote and remote.get(ts_key, 0) > new.get(ts_key, 0):
+                    return remote
+                return new
+
+            merged_digest = _merge_daily_state(remote_digest, new_digest_state)
+            merged_poll = _merge_daily_state(remote_poll, new_poll_state)
+            merged_quiz = _merge_daily_state(remote_quiz, new_quiz_state)
+            merged_weekly_recap = _merge_daily_state(remote_weekly_recap, new_weekly_recap_state)
             merged_alert = {
                 "last_alert": max(remote_alert.get("last_alert", 0), new_alert_timestamp or 0)
             }
@@ -2246,24 +1919,37 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
             if diff.returncode == 0:
                 print("[INFO] State files unchanged, nothing to commit.")
-                return
+                return True
 
             subprocess.run(["git", "commit", "-m", "chore: update bot state [skip ci]"], check=False)
             push = subprocess.run(["git", "push"], capture_output=True, text=True)
             if push.returncode == 0:
                 print("[INFO] State files committed and pushed.")
-                return
+                return True
             backoff = min(2 * (2 ** (attempt - 1)), 30) + random.uniform(0, 1.5)
             print(f"[WARN] git push failed (attempt {attempt}/{MAX_PUSH_ATTEMPTS}), "
                   f"retrying in {backoff:.1f}s with fresh fetch: {push.stderr}")
             time.sleep(backoff)
 
+        # ФИКС (см. также разбор дублирующегося опроса выше): раньше здесь
+        # стоял `raise RuntimeError(...)`, который убивал весь процесс.
+        # Это НЕ давало никакого дополнительного шанса на повторную
+        # попытку (следующий запуск всё равно стартует по cron независимо
+        # от того, упал ли этот процесс с исключением или тихо завершился) —
+        # единственным эффектом был красный крест в истории запусков и,
+        # что важнее, прерывание скрипта ДО того, как успевали
+        # записаться в лог остальные детали. Теперь просто предупреждаем и
+        # возвращаем False — вызывающий код это не считает фатальной
+        # ошибкой (Telegram-отправка уже состоялась, лучше сохранить
+        # видимость и не падать), а MIN_*_GAP_SECONDS выше защищает от
+        # повторной отправки в следующем запуске, даже если состояние не
+        # запушилось.
         print(f"[WARN] Could not push state after {MAX_PUSH_ATTEMPTS} attempts — "
-              f"next run may briefly re-see this item.")
-        raise RuntimeError(f"Failed to persist bot state to git after {MAX_PUSH_ATTEMPTS} attempts")
+              f"next run may briefly re-see this item (mitigated by MIN_*_GAP_SECONDS guards).")
+        return False
     except Exception as e:
         print(f"[WARN] persist_state_to_git error: {e}")
-        raise
+        return False
 
 
 def main():
@@ -2271,10 +1957,8 @@ def main():
 
     dt_msk = now_msk()
     day_key = today_key(dt_msk)
+    now_ts = time.time()
 
-    # Признаки 3/4: считаем "тишину" один раз в начале запуска — до того,
-    # как что-либо в этом запуске может обновить last_run.json — иначе
-    # алерт никогда не сработает (свежая публикация всегда обнулит elapsed).
     elapsed_at_start = seconds_since_last_publish()
     new_alert_timestamp = check_silence_alert(elapsed_at_start)
 
@@ -2286,36 +1970,37 @@ def main():
             **kwargs,
         )
 
-    # --- Реакции: включаем один раз, статус запоминаем, чтобы не дёргать API зря ---
     # --- Ежедневный вовлекающий опрос ---
-    poll_state = _load_json(POLL_STATE_FILE, {"date": None, "sent": False})
+    poll_state = _load_json(POLL_STATE_FILE, {"date": None, "sent": False, "last_sent_ts": 0})
     if poll_state.get("date") != day_key:
-        poll_state = {"date": day_key, "sent": False}
+        poll_state = {"date": day_key, "sent": False, "last_sent_ts": poll_state.get("last_sent_ts", 0)}
     new_poll_state = None
-    if due_poll(dt_msk, poll_state.get("sent")):
+    # ФИКС: добавлена защита по минимальному интервалу (MIN_POLL_GAP_SECONDS)
+    # в дополнение к флагу "sent за сегодня" — см. комментарий у константы.
+    if due_poll(dt_msk, poll_state.get("sent")) and (now_ts - poll_state.get("last_sent_ts", 0)) >= MIN_POLL_GAP_SECONDS:
         variant = pick_poll_variant(day_key)
         if send_poll_to_telegram(variant["question"], variant["options"]):
             poll_state["sent"] = True
+            poll_state["last_sent_ts"] = now_ts
             new_poll_state = poll_state
             print(f"[INFO] Engagement poll sent: '{variant['question']}'")
 
     # --- Ежедневный квиз по реальным опубликованным новостям ---
-    quiz_state = _load_json(QUIZ_STATE_FILE, {"date": None, "sent": False})
+    quiz_state = _load_json(QUIZ_STATE_FILE, {"date": None, "sent": False, "last_sent_ts": 0})
     if quiz_state.get("date") != day_key:
-        quiz_state = {"date": day_key, "sent": False}
+        quiz_state = {"date": day_key, "sent": False, "last_sent_ts": quiz_state.get("last_sent_ts", 0)}
     new_quiz_state = None
-    if due_quiz(dt_msk, quiz_state.get("sent")):
+    if due_quiz(dt_msk, quiz_state.get("sent")) and (now_ts - quiz_state.get("last_sent_ts", 0)) >= MIN_QUIZ_GAP_SECONDS:
         source_post = pick_quiz_source_post(load_recent_posts())
         quiz = build_quiz_from_post(source_post)
         if quiz and send_quiz_poll(quiz):
             quiz_state["sent"] = True
+            quiz_state["last_sent_ts"] = now_ts
             new_quiz_state = quiz_state
             print(f"[INFO] Daily quiz sent: '{quiz['question']}'")
         else:
-            # Не нашлось материала или GigaChat не смог составить вопрос —
-            # помечаем день пройденным, чтобы не пытаться на каждом
-            # следующем тике в это же окно.
             quiz_state["sent"] = True
+            quiz_state["last_sent_ts"] = now_ts
             new_quiz_state = quiz_state
             print("[INFO] No material/quiz for today, marking as done anyway.")
 
@@ -2325,43 +2010,32 @@ def main():
 
     # --- Еженедельный рекап "Главное за неделю" ---
     week_key = week_key_for(dt_msk)
-    weekly_recap_state = _load_json(WEEKLY_RECAP_STATE_FILE, {"week_key": None, "sent": False})
+    weekly_recap_state = _load_json(WEEKLY_RECAP_STATE_FILE, {"week_key": None, "sent": False, "last_sent_ts": 0})
     new_weekly_recap_state = None
-    if due_weekly_recap(dt_msk, week_key, weekly_recap_state):
+    if due_weekly_recap(dt_msk, week_key, weekly_recap_state) and \
+            (now_ts - weekly_recap_state.get("last_sent_ts", 0)) >= MIN_WEEKLY_RECAP_GAP_SECONDS:
         recap_items = pick_weekly_recap_items(load_recent_posts())
         if recap_items:
             recap_text = format_weekly_recap(recap_items)
             if send_to_telegram(recap_text):
-                new_weekly_recap_state = {"week_key": week_key, "sent": True}
+                new_weekly_recap_state = {"week_key": week_key, "sent": True, "last_sent_ts": now_ts}
                 print(f"[INFO] Weekly recap sent: {len(recap_items)} items.")
         else:
-            # Нечего показывать (например, самая первая неделя работы бота) —
-            # всё равно помечаем неделю пройденной, чтобы не пытаться на
-            # каждом следующем тике воскресенья в это же окно.
-            new_weekly_recap_state = {"week_key": week_key, "sent": True}
+            new_weekly_recap_state = {"week_key": week_key, "sent": True, "last_sent_ts": now_ts}
             print("[INFO] No material for weekly recap, marking week as done anyway.")
 
     # --- Дайджест по расписанию (утро/вечер) ---
-    digest_state = _load_json(DIGEST_STATE_FILE, {"date": None, "slots": []})
+    digest_state = _load_json(DIGEST_STATE_FILE, {"date": None, "slots": [], "last_sent_ts": 0})
     if digest_state.get("date") != day_key:
-        digest_state = {"date": day_key, "slots": []}
+        digest_state = {"date": day_key, "slots": [], "last_sent_ts": digest_state.get("last_sent_ts", 0)}
     new_digest_state = None
 
     slot = due_digest_slot(dt_msk, digest_state.get("slots", []))
-    if slot:
+    if slot and (now_ts - digest_state.get("last_sent_ts", 0)) >= MIN_DIGEST_GAP_SECONDS:
         digest_items = fetch_news()
-        # Срочные — в начало, дальше внутри каждой группы — по приоритету
-        # категорий пользователя и источника ТАСС (та же система, что и
-        # в одиночных постах).
         digest_items = order_candidates_by_priority(digest_items, load_recent_posts())
         digest_items.sort(key=lambda it: not it.get("urgent"))
 
-        # РАДИКАЛЬНЫЙ ФИКС: та же проверка по словам+именным стемам
-        # (Уровень B), что и в pick_non_duplicate — без неё дайджест мог
-        # включить новость, уже опубликованную одиночным постом другими
-        # словами. ИИ-проверку (Уровень C) здесь не делаем — дайджест и
-        # так собирает до 5 новостей, дороже по времени/токенам смысла
-        # мало, Уровня B обычно достаточно для этого сценария.
         recent_posts_for_digest = load_recent_posts()
         common_entities_digest = compute_common_entity_stems(recent_posts_for_digest)
         digest_items = [
@@ -2385,10 +2059,6 @@ def main():
             if digest_msg_id:
                 posted = load_posted()
                 new_posted_ids = []
-                # ФИКС: раньше слова заголовков элементов дайджеста нигде не
-                # сохранялись — из-за этого meaning-дедуп "не знал" про
-                # новости, ушедшие в дайджест, и потом мог пропустить точно
-                # такую же новость от другого канала как "новую".
                 recent_words = load_recent_title_words()
                 new_title_words_list = []
                 new_recent_posts_entries = []
@@ -2411,6 +2081,7 @@ def main():
                 save_recent_posts(load_recent_posts() + new_recent_posts_entries)
 
                 digest_state["slots"] = digest_state.get("slots", []) + [slot]
+                digest_state["last_sent_ts"] = now_ts
                 new_digest_state = digest_state
                 mark_published_now()
 
@@ -2470,9 +2141,6 @@ def main():
         with_video = [it for it in items if it.get("video")]
         return with_video if with_video else items
 
-    # Приоритет по категориям пользователя (Политика/Финансы/СВО/Москва/
-    # Происшествия/Спорт) и по источнику ТАСС — применяется и к срочным,
-    # и к обычным кандидатам, как единая система, а не выбор ИИ "на глаз".
     _recent_posts_for_priority = load_recent_posts()
 
     if urgent_items:
@@ -2491,24 +2159,10 @@ def main():
                 )
             return
         normal_items = prefer_video(normal_items)
-        # ФИКС: раньше здесь ИИ (pick_featured_index) выбирал "самую
-        # интересную" новость на своё усмотрение — заменено на явную
-        # приоритетную систему по категориям пользователя и источнику
-        # ТАСС, как и было запрошено, вместо непрозрачного выбора ИИ.
         ordered = order_candidates_by_priority(normal_items, _recent_posts_for_priority)
 
-    # ФИКС: финальная проверка на дубликат прямо перед отправкой (см.
-    # pick_non_duplicate) — на случай, если что-то очень похожее было
-    # опубликовано (например, дайджестом) уже после того, как мы собрали
-    # список кандидатов.
     chosen = pick_non_duplicate(ordered)
 
-    # ФИКС (реальный кейс из лога): если срочные новости ЕСТЬ, но ВСЕ они
-    # оказались дублями уже опубликованного — раньше бот сдавался на всём
-    # запуске целиком, хотя в пуле могли быть десятки обычных (не срочных)
-    # свежих кандидатов, которые даже не рассматривались. Теперь при таком
-    # исходе даём вторую попытку на обычных новостях вместо того, чтобы
-    # выбрасывать весь прогон впустую.
     if chosen is None and urgent_items:
         if elapsed is None or elapsed >= PUBLISH_INTERVAL:
             print("[INFO] Все срочные кандидаты — дубли, пробуем обычные новости из того же пула.")
@@ -2530,10 +2184,6 @@ def main():
             )
         return
 
-    # "Продолжение истории": кандидат уже прошёл все проверки на дубликат
-    # выше — если он всё же связан с недавним постом (общее место/персона),
-    # добавим ссылку на предыдущий пост вместо того, чтобы публиковать
-    # несвязанные друг с другом посты об одном и том же сюжете.
     _recent_posts_for_continuation = load_recent_posts()
     chosen["continuation_of"] = find_story_continuation(
         chosen["title"], chosen.get("summary", ""), _recent_posts_for_continuation,
@@ -2542,11 +2192,6 @@ def main():
 
     chosen = finalize_item(chosen)
 
-    # ЖИВАЯ ТРАНСЛЯЦИЯ: только для срочных новостей. Если кандидат — явное
-    # развитие уже идущей трансляции (общее место/персона, трансляция не
-    # "остыла"), редактируем существующий закреплённый пост вместо
-    # публикации нового — читатель видит один растущий живой пост, а не
-    # ленту разрозненных сообщений об одном и том же событии.
     if chosen.get("urgent"):
         live_threads_now = load_live_threads()
         common_entities_live = compute_common_entity_stems(load_recent_posts())
@@ -2618,9 +2263,6 @@ def main():
             if latency is not None:
                 save_speed_stats(load_speed_stats() + [{"latency_seconds": latency, "ts": time.time()}])
             if item.get("urgent") and isinstance(ok, int):
-                # Срочная новость без подходящей активной трансляции —
-                # начинаем новую и закрепляем пост, чтобы дальнейшие
-                # обновления по этой теме редактировали именно его.
                 new_thread = start_live_thread(item, ok)
                 save_live_threads(load_live_threads() + [new_thread])
                 pin_message(ok)
