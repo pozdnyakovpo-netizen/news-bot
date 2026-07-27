@@ -1,0 +1,18 @@
+# Список RSS-лент федеральных изданий — читается отдельно от feeds.txt,
+# параллельно Telegram-каналам. Одна строка — один URL RSS-ленты.
+# Строки с # игнорируются.
+#
+# Список проверен по нескольким независимым источникам на актуальность
+# путей. Если какая-то ссылка перестанет работать (издание меняет
+# структуру сайта) — она просто будет пропущена с предупреждением в
+# логе, остальные ленты продолжат работать как обычно.
+
+https://tass.ru/rss/v2.xml
+https://ria.ru/export/rss2/index.xml
+https://www.interfax.ru/rss.asp
+https://www.kommersant.ru/RSS/news.xml
+https://www.vedomosti.ru/rss/news
+https://rg.ru/xml/index.xml
+https://lenta.ru/rss
+https://www.gazeta.ru/export/rss/first.xml
+https://www.rt.com/rss/
