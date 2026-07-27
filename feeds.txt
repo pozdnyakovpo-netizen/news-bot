@@ -37,3 +37,4 @@ ENews112
 moscowmap
 # --- Независимое издание (см. примечание про статус иноагента) ---
 astrapress
+Restore feeds.txt after accidental overwrite
