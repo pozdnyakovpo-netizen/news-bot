@@ -63,6 +63,11 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 FEEDS_FILE = "feeds.txt"
 FEEDS_BACKUP_FILE = "feeds_backup.txt"
 SELF_HEAL_LOG_FILE = "self_heal_log.json"
+STEM_MATCH_LOG_FILE = "stem_match_log.json"
+LEARNED_EXCLUDED_ENTITIES_FILE = "learned_excluded_entities.json"
+STEM_MATCH_LOG_LIMIT = 400
+STEM_AUDIT_MIN_CLUSTERS = 3
+STEM_AUDIT_MIN_SAMPLES = 4
 POSTED_FILE = "posted.json"
 LAST_RUN_FILE = "last_run.json"
 PUBLISH_INTERVAL = 300  # ФИКС: было 600 (10 мин) — цель "раз в 5-10 минут"
@@ -491,9 +496,86 @@ def extract_entity_stems(text):
 # возможность связать парафразы одной истории. Подняли оба порога — теперь
 # исключаются только действительно вездесущие имена (Трамп и т.п.), а не
 # любое достаточно популярное направление новостей.
+def load_learned_excluded_entities():
+    return set(_load_json(LEARNED_EXCLUDED_ENTITIES_FILE, []))
+
+
+def save_learned_excluded_entities(entities):
+    _save_json(LEARNED_EXCLUDED_ENTITIES_FILE, sorted(entities))
+
+
+# --- Самоаудит качества сопоставлений (высокий уровень самоулучшения) ---
+# Не только чинит уже НАЙДЕННЫЕ нами коллизии (см. RUSSIAN_REGIONS_
+# GAZETTEER выше и history этого разговора про "владимир"/"орел") — а
+# ищет БУДУЩИЕ, ещё не обнаруженные, полностью автономно. Идея: если
+# один и тот же именной стем регулярно "срабатывает" в парах постов,
+# компаньоны которых (другие сущности рядом) совершенно РАЗНЫЕ и не
+# пересекаются между собой — это статистический признак того, что сам
+# стем не надёжный маркер конкретного места/персоны, а частое слово/имя
+# (как было с "владимир" — то рядом с "путин", то с чьей-то фамилией,
+# то ещё с чем-то не связанным). Такой стем автоматически добавляется в
+# список исключений — раз и навсегда, без участия человека.
+def audit_entity_stem_quality():
+    log = _load_json(STEM_MATCH_LOG_FILE, [])
+    if not log:
+        return 0
+    by_stem = {}
+    for entry in log:
+        stem = entry.get("stem")
+        if not stem:
+            continue
+        by_stem.setdefault(stem, []).append(set(entry.get("companions", [])))
+
+    already_excluded = load_learned_excluded_entities()
+    newly_flagged = []
+    for stem, companion_sets in by_stem.items():
+        if stem in already_excluded or len(companion_sets) < STEM_AUDIT_MIN_SAMPLES:
+            continue
+        n = len(companion_sets)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if companion_sets[i] & companion_sets[j]:
+                    union(i, j)
+        distinct_clusters = len({find(i) for i in range(n)})
+        if distinct_clusters >= STEM_AUDIT_MIN_CLUSTERS:
+            newly_flagged.append(stem)
+
+    if newly_flagged:
+        updated = already_excluded | set(newly_flagged)
+        save_learned_excluded_entities(updated)
+        record_self_heal_event(
+            "entity_stem_auto_excluded",
+            f"Автоматически исключены из сопоставления {len(newly_flagged)} именных "
+            f"стем(ов) — статистически ведут себя как частые слова/имена, а не "
+            f"надёжные маркеры конкретного места/персоны (встречались в несвязанных "
+            f"друг с другом парах новостей): {', '.join(sorted(newly_flagged))}."
+        )
+    return len(newly_flagged)
+
+
 def compute_common_entity_stems(recent_posts, min_count=10, max_fraction=0.35):
+    # ФИКС: теперь помимо статического исключения по частоте (см. ниже)
+    # всегда подмешивается САМООБУЧЕННЫЙ список — стемы, которые
+    # audit_entity_stem_quality() уже успел признать "промискуитетными"
+    # в прошлых прогонах. Это единая точка, через которую проходят ВСЕ
+    # проверки (дедуп, "продолжение истории", "прямой эфир", хроника),
+    # поэтому однажды обнаруженная проблема чинится сразу везде.
+    learned = load_learned_excluded_entities()
     if not recent_posts:
-        return set()
+        return set(learned)
     counter = {}
     for post in recent_posts:
         stems = extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))
@@ -501,7 +583,8 @@ def compute_common_entity_stems(recent_posts, min_count=10, max_fraction=0.35):
             counter[stem] = counter.get(stem, 0) + 1
     total = len(recent_posts)
     threshold = max(min_count, total * max_fraction)
-    return {stem for stem, count in counter.items() if count >= threshold}
+    frequent = {stem for stem, count in counter.items() if count >= threshold}
+    return frequent | learned
 
 
 def titles_are_similar(words_a, words_b, threshold=0.5):
@@ -687,6 +770,22 @@ def format_fact_update(candidate_title, matched_post, kw, old_val, new_val):
 STORY_CONTINUATION_WINDOW_HOURS = 48
 
 
+def record_stem_match(stem, entities_a, entities_b):
+    # "Сырые данные" для самоаудита качества сопоставлений (см. audit_
+    # entity_stem_quality ниже): при каждой успешной связке ("продолжение
+    # истории" / "прямой эфир") запоминаем, с какими ДРУГИМИ сущностями
+    # этот стем встретился на этот раз. Если один и тот же стем регулярно
+    # оказывается рядом с совершенно РАЗНЫМИ, не связанными между собой
+    # компаньонами — это и есть признак того, что сам стем "промискуитетен"
+    # (частое слово/имя, а не надёжный маркер конкретного места/персоны),
+    # как было с "владимир"/"орел" — только теперь это обнаруживается
+    # автоматически, а не только при ручной проверке.
+    companions = tuple(sorted((entities_a | entities_b) - {stem}))[:10]
+    log = _load_json(STEM_MATCH_LOG_FILE, [])
+    log.append({"stem": stem, "companions": list(companions), "ts": time.time()})
+    _save_json(STEM_MATCH_LOG_FILE, log[-STEM_MATCH_LOG_LIMIT:])
+
+
 def find_story_continuation(candidate_title, candidate_summary, recent_posts,
                              hours=STORY_CONTINUATION_WINDOW_HOURS, exclude_entities=None):
     # ФИКС (жалоба: "продолжение истории возвращается к совершенно другим
@@ -708,6 +807,7 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
     now = time.time()
     best = None
     best_ts = -1
+    best_shared = None
     for post in recent_posts:
         if not post.get("message_id"):
             continue
@@ -715,7 +815,8 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
         if ts and now - ts > hours * 3600:
             continue
         p_entities = (extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))) - exclude_entities
-        if not (c_entities & p_entities):
+        shared = c_entities & p_entities
+        if not shared:
             continue
         p_words = content_words(post.get("headline", ""), post.get("summary", ""))
         if not titles_are_similar(c_words, p_words, threshold=0.15):
@@ -723,6 +824,11 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
         if (ts or 0) >= best_ts:
             best = post
             best_ts = ts or 0
+            best_shared = (shared, c_entities, p_entities)
+    if best_shared:
+        shared, ea, eb = best_shared
+        for stem in shared:
+            record_stem_match(stem, ea, eb)
     return best
 
 
@@ -767,6 +873,9 @@ def find_active_live_thread(candidate_title, candidate_summary, threads, exclude
         t_words = significant_title_words(thread_text)
         if not titles_are_similar(c_words, t_words, threshold=0.15):
             continue
+        shared = c_entities & t_entities
+        for stem in shared:
+            record_stem_match(stem, c_entities, t_entities)
         return thread
     return None
 
@@ -3661,6 +3770,7 @@ STATE_FILES = [
     SUBSCRIBER_HISTORY_FILE, DASHBOARD_FILE, NOJEKYLL_FILE, STORY_TIMELINE_STATE_FILE,
     FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
     MEDIA_KIT_FILE, CHANNEL_VIEWS_FILE,
+    STEM_MATCH_LOG_FILE, LEARNED_EXCLUDED_ENTITIES_FILE,
     RSS_FEED_FILE, CORRECTIONS_LOG_FILE, CORRECTIONS_PAGE_FILE, EDITORIAL_POLICY_PAGE_FILE,
     ENTITY_INDEX_FILE, DOSSIERS_INDEX_FILE, DOSSIER_STATE_FILE, GEO_PAGE_FILE,
 ]
@@ -3828,6 +3938,8 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                 with open(FEEDS_BACKUP_FILE, "r", encoding="utf-8", errors="ignore") as f:
                     local_feeds_backup_content = f.read()
             local_self_heal_log = load_self_heal_log()
+            local_stem_match_log = _load_json(STEM_MATCH_LOG_FILE, [])
+            local_learned_excluded = load_learned_excluded_entities()
             local_corrections_log = load_corrections_log()
             local_channel_views = load_channel_views()
             local_entity_index = load_entity_index()
@@ -3849,6 +3961,14 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
             merged_corrections_log = (list(remote_corrections_log) + local_corrections_log)[-CORRECTIONS_LOG_LIMIT:]
             save_corrections_log(merged_corrections_log)
             save_self_heal_log(merged_self_heal_log)
+
+            remote_stem_match_log = _git_show_json(f"origin/main:{STEM_MATCH_LOG_FILE}", [])
+            merged_stem_match_log = (list(remote_stem_match_log) + local_stem_match_log)[-STEM_MATCH_LOG_LIMIT:]
+            _save_json(STEM_MATCH_LOG_FILE, merged_stem_match_log)
+
+            remote_learned_excluded = set(_git_show_json(f"origin/main:{LEARNED_EXCLUDED_ENTITIES_FILE}", []))
+            merged_learned_excluded = remote_learned_excluded | local_learned_excluded
+            save_learned_excluded_entities(merged_learned_excluded)
 
             save_posted(merged_posted)
             save_recent_title_words(merged_recent)
@@ -4151,11 +4271,13 @@ def run_self_healing_checks():
     feeds_status = ensure_feeds_file_healthy()
     telegram_ok = check_and_alert_token_health()
     expired_pins_healed = self_heal_expired_pins()
+    newly_excluded_stems = audit_entity_stem_quality()
     return {
         "feeds_ok": feeds_status["feeds_ok"],
         "feeds_healed_this_run": feeds_status["healed"],
         "telegram_ok": telegram_ok,
         "expired_pins_healed_this_run": expired_pins_healed,
+        "newly_excluded_stems_this_run": newly_excluded_stems,
         "checked_at": datetime.utcnow().isoformat(),
     }
 
