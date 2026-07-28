@@ -2571,7 +2571,7 @@ MIN_DOSSIER_GAP_SECONDS = 20 * 3600
 CORRECTIONS_LOG_LIMIT = 300
 
 
-def _svg_sparkline(history, width=640, height=140, pad=24):
+def _svg_sparkline(history, width=640, height=140, pad=24, uid="a"):
     if not history or len(history) < 2:
         return ""
     values = [h["count"] for h in history]
@@ -2587,13 +2587,33 @@ def _svg_sparkline(history, width=640, height=140, pad=24):
         return height - pad - ((v - min_v) / span) * (height - 2 * pad)
 
     points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
+    area_points = f"{x(0):.1f},{height - pad} " + points + f" {x(n-1):.1f},{height - pad}"
     last_x, last_y = x(n - 1), y(values[-1])
     first_date = html.escape(history[0]["date"])
     last_date = html.escape(history[-1]["date"])
+    grad_id = f"sparkgrad-{uid}"
+    glow_id = f"sparkglow-{uid}"
     return f"""
     <svg viewBox="0 0 {width} {height}" class="sparkline" xmlns="http://www.w3.org/2000/svg">
-      <polyline fill="none" stroke="#4fd1c5" stroke-width="2.5" points="{points}" />
-      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4.5" fill="#4fd1c5" />
+      <defs>
+        <linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#4fd1c5" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="#4fd1c5" stop-opacity="0"/>
+        </linearGradient>
+        <filter id="{glow_id}" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="3" result="blur"/>
+          <feMerge>
+            <feMergeNode in="blur"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+      <polygon points="{area_points}" fill="url(#{grad_id})" stroke="none"/>
+      <polyline class="spark-line" fill="none" stroke="#4fd1c5" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round" points="{points}" filter="url(#{glow_id})"/>
+      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="5" fill="#4fd1c5" filter="url(#{glow_id})">
+        <animate attributeName="r" values="4;6;4" dur="2s" repeatCount="indefinite"/>
+      </circle>
       <text x="{pad}" y="{height - 4}" class="spark-label">{first_date}</text>
       <text x="{width - pad}" y="{height - 4}" class="spark-label" text-anchor="end">{last_date}</text>
     </svg>
@@ -2635,7 +2655,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
     ) if self_heal_log else '<li class="muted">Пока не потребовалось ни одного автоматического исправления</li>'
 
     current_subs = subscriber_history[-1]["count"] if subscriber_history else None
-    sparkline_svg = _svg_sparkline(subscriber_history)
+    sparkline_svg = _svg_sparkline(subscriber_history, uid="dash")
 
     top_sources = list(source_contribution.items())[:8]
     source_rows = "".join(
@@ -2659,36 +2679,90 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 <title>{html.escape(CHANNEL_USERNAME)} — статус канала</title>
 <style>
   :root {{
-    --bg: #0d1117; --card: #161b22; --border: #30363d;
-    --text: #e6edf3; --muted: #8b949e; --accent: #4fd1c5;
+    --bg: #0a0e14; --card: rgba(22, 29, 39, 0.6); --border: rgba(255,255,255,0.08);
+    --text: #eef2f6; --muted: #8b96a5; --accent: #4fd1c5; --accent2: #7c5cff;
   }}
   * {{ box-sizing: border-box; }}
+  html {{ scroll-behavior: smooth; }}
   body {{
-    margin: 0; padding: 32px 16px 64px; background: var(--bg); color: var(--text);
+    margin: 0; padding: 40px 16px 72px; color: var(--text); min-height: 100vh;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background:
+      radial-gradient(circle at 15% 0%, rgba(124,92,255,0.16), transparent 45%),
+      radial-gradient(circle at 85% 15%, rgba(79,209,197,0.14), transparent 45%),
+      radial-gradient(circle at 50% 100%, rgba(79,209,197,0.08), transparent 55%),
+      var(--bg);
+    background-attachment: fixed;
   }}
-  .wrap {{ max-width: 880px; margin: 0 auto; }}
-  h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
-  .subtitle {{ color: var(--muted); margin-top: 0; margin-bottom: 28px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }}
-  .card .label {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-  .card .value {{ font-size: 1.6rem; font-weight: 600; margin-top: 6px; }}
+  .wrap {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{
+    font-size: 1.7rem; margin-bottom: 4px; font-weight: 800; letter-spacing: -0.02em;
+    background: linear-gradient(120deg, #ffffff 20%, var(--accent) 60%, var(--accent2) 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: inline-flex; align-items: center; gap: 10px;
+  }}
+  .subtitle {{ color: var(--muted); margin-top: 2px; margin-bottom: 32px; font-size: 0.92rem; }}
+  .subtitle a {{ transition: color 0.2s ease; }}
+  .subtitle a:hover {{ color: var(--accent); }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px; }}
+  .card {{
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 20px 22px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+    transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+    position: relative; overflow: hidden;
+  }}
+  .card::before {{
+    content: ""; position: absolute; inset: 0; border-radius: 16px; padding: 1px;
+    background: linear-gradient(135deg, rgba(79,209,197,0.35), rgba(124,92,255,0.05) 40%, transparent 70%);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude; pointer-events: none;
+  }}
+  .card:hover {{
+    transform: translateY(-3px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px rgba(79,209,197,0.25);
+    border-color: rgba(79,209,197,0.3);
+  }}
+  .card .label {{ color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em; }}
+  .card .value {{
+    font-size: 1.7rem; font-weight: 700; margin-top: 8px;
+    background: linear-gradient(120deg, #fff, var(--accent));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }}
   .card.wide {{ grid-column: 1 / -1; }}
-  .sparkline {{ width: 100%; height: auto; margin-top: 8px; }}
+  .sparkline {{ width: 100%; height: auto; margin-top: 8px; overflow: visible; }}
+  .spark-line {{ animation: draw-line 1.4s ease-out forwards; }}
+  @keyframes draw-line {{ from {{ opacity: 0; transform: scaleY(0.85); }} to {{ opacity: 1; transform: scaleY(1); }} }}
   .spark-label {{ fill: var(--muted); font-size: 11px; }}
-  .bar-row {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; }}
+  .bar-row {{ display: flex; align-items: center; gap: 10px; margin: 10px 0; }}
   .bar-label {{ width: 140px; font-size: 0.85rem; color: var(--muted); flex-shrink: 0; }}
-  .bar-track {{ flex: 1; background: #21262d; border-radius: 6px; height: 10px; overflow: hidden; }}
-  .bar-fill {{ background: var(--accent); height: 100%; border-radius: 6px; }}
+  .bar-track {{ flex: 1; background: rgba(255,255,255,0.06); border-radius: 8px; height: 10px; overflow: hidden; }}
+  .bar-fill {{
+    background: linear-gradient(90deg, var(--accent2), var(--accent));
+    height: 100%; border-radius: 8px; box-shadow: 0 0 12px rgba(79,209,197,0.5);
+    width: 0; transition: width 1.1s cubic-bezier(.2,.8,.2,1);
+  }}
   .bar-count {{ width: 36px; text-align: right; font-size: 0.85rem; color: var(--muted); }}
   ul {{ list-style: none; padding: 0; margin: 8px 0 0; }}
-  li {{ padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.92rem; }}
+  li {{ padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 0.92rem; }}
   li:last-child {{ border-bottom: none; }}
   .cat-emoji {{ margin-right: 8px; }}
   .muted {{ color: var(--muted); }}
-  footer {{ color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }}
-  a {{ color: var(--accent); }}
+  .status-line {{ display: flex; align-items: center; gap: 10px; font-size: 1.1rem; }}
+  .pulse-dot {{
+    width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0;
+    background: {"#22c55e" if healthy else "#ef4444"};
+    box-shadow: 0 0 0 0 {"rgba(34,197,94,0.6)" if healthy else "rgba(239,68,68,0.6)"};
+    animation: pulse 2s infinite;
+  }}
+  @keyframes pulse {{
+    0% {{ box-shadow: 0 0 0 0 {"rgba(34,197,94,0.55)" if healthy else "rgba(239,68,68,0.55)"}; }}
+    70% {{ box-shadow: 0 0 0 12px rgba(0,0,0,0); }}
+    100% {{ box-shadow: 0 0 0 0 rgba(0,0,0,0); }}
+  }}
+  footer {{ color: var(--muted); font-size: 0.8rem; margin-top: 36px; text-align: center; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -2699,7 +2773,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
   <div class="grid">
     <div class="card">
       <div class="label">Статус</div>
-      <div class="value" style="font-size:1.1rem">{health_badge}</div>
+      <div class="value status-line" style="font-size:1.1rem"><span class="pulse-dot"></span>{("Работает штатно" if healthy else "Возможен сбой")}</div>
     </div>
     <div class="card">
       <div class="label">Последняя публикация</div>
@@ -2707,7 +2781,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
     </div>
     <div class="card">
       <div class="label">Подписчиков</div>
-      <div class="value">{current_subs if current_subs is not None else "—"}</div>
+      <div class="value" data-count="{current_subs if current_subs is not None else 0}">{current_subs if current_subs is not None else "—"}</div>
     </div>
     <div class="card">
       <div class="label">Скорость публикации (медиана)</div>
@@ -2740,6 +2814,29 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 
   <footer>Обновляется автоматически ботом · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
 </div>
+<script>
+  // Плавная заливка полос "вклад источников" при загрузке страницы.
+  document.querySelectorAll('.bar-fill').forEach(function(el, i) {{
+    var target = el.style.width;
+    el.style.width = '0%';
+    setTimeout(function() {{ el.style.width = target; }}, 80 + i * 60);
+  }});
+  // Анимированный счётчик подписчиков.
+  document.querySelectorAll('[data-count]').forEach(function(el) {{
+    var target = parseInt(el.getAttribute('data-count'), 10);
+    if (!target) return;
+    var start = 0, duration = 900, startTime = null;
+    function step(ts) {{
+      if (!startTime) startTime = ts;
+      var progress = Math.min((ts - startTime) / duration, 1);
+      var eased = 1 - Math.pow(1 - progress, 3);
+      el.textContent = Math.round(start + (target - start) * eased);
+      if (progress < 1) requestAnimationFrame(step);
+      else el.textContent = target;
+    }}
+    requestAnimationFrame(step);
+  }});
+</script>
 </body>
 </html>"""
 
@@ -2752,7 +2849,7 @@ def build_media_kit_html(status, subscriber_history, engagement_stats, self_heal
     growth_pct = None
     if current_subs is not None and first_subs and first_subs > 0:
         growth_pct = round((current_subs - first_subs) / first_subs * 100, 1)
-    sparkline_svg = _svg_sparkline(subscriber_history)
+    sparkline_svg = _svg_sparkline(subscriber_history, uid="media")
 
     median_latency = status.get("median_publish_latency_minutes")
     healthy = status.get("healthy")
