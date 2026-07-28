@@ -1571,6 +1571,30 @@ def split_long_sentences(text, max_words=25):
     return " ".join(result)
 
 
+# --- Практика федеральных изданий (РБК/Коммерсантъ): ключевые цифры в
+# тексте всегда выделены жирным для быстрого сканирования на телефоне.
+# Работает ПОСЛЕ html.escape() текста (регулярка ищет уже безопасный
+# текст, добавляет только теги <b>/</b> — не трогает никакую другую
+# логику формирования поста).
+BOLD_NUMBER_CONTEXT_WORDS = (
+    "человек", "погиб", "ранен", "пострадал", "жертв", "млрд", "млн",
+    "тысяч", "процент", "рубл", "доллар", "евро",
+)
+
+
+def bold_key_numbers(escaped_text):
+    if not escaped_text:
+        return escaped_text
+    # Число (с возможным % сразу после) перед одним из контекстных слов —
+    # осторожный шаблон, чтобы не задеть уже вставленные HTML-теги вокруг.
+    pattern = r'(?<![>\d])(\d[\d\s.,]*)(%)?\s+(?=(?:' + "|".join(BOLD_NUMBER_CONTEXT_WORDS) + r'))'
+    def repl(match):
+        number = match.group(1)
+        percent = match.group(2) or ""
+        return f"<b>{number}{percent}</b> "
+    return re.sub(pattern, repl, escaped_text)
+
+
 def paragraphize(text, sentences_per_para=2):
     if not text:
         return text
@@ -1601,9 +1625,9 @@ def finalize_item(item):
 
     if item.get("urgent"):
         urgent_body = limit_sentences(body_raw, max_sentences=2)
-        item["body"] = html.escape(urgent_body) if urgent_body else ""
+        item["body"] = bold_key_numbers(html.escape(urgent_body)) if urgent_body else ""
     else:
-        item["body"] = html.escape(paragraphize(body_raw)) if body_raw else ""
+        item["body"] = bold_key_numbers(html.escape(paragraphize(body_raw))) if body_raw else ""
 
     item["category"] = detect_category(item["title"], item.get("summary", ""))
 
