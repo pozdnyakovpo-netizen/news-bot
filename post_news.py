@@ -2595,6 +2595,8 @@ CORRECTIONS_LOG_FILE = "corrections_log.json"
 CORRECTIONS_PAGE_FILE = os.path.join(DOCS_DIR, "corrections.html")
 EDITORIAL_POLICY_PAGE_FILE = os.path.join(DOCS_DIR, "o-redakcii.html")
 ENTITY_INDEX_FILE = "entity_index.json"
+GEO_PAGE_FILE = os.path.join(DOCS_DIR, "geo.html")
+GEO_LOOKBACK_DAYS = 7
 DOSSIERS_INDEX_FILE = os.path.join(DOCS_DIR, "dossiers.html")
 DOSSIERS_DIR = os.path.join(DOCS_DIR, "dossiers")
 MIN_MENTIONS_FOR_DOSSIER = 3
@@ -2803,7 +2805,7 @@ def build_dashboard_html(status, recent_posts, subscriber_history, source_contri
 <body>
 <div class="wrap">
   <h1>📡 {html.escape(CHANNEL_USERNAME)}</h1>
-  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a> · <a href="corrections.html">архив уточнений</a> · <a href="o-redakcii.html">редполитика</a> · <a href="dossiers.html">база знаний</a> · <a href="rss.xml">RSS</a></p>
+  <p class="subtitle">Живая статистика новостного канала · <a href="{html.escape(CHANNEL_LINK)}">открыть канал</a> · <a href="media-kit.html">медиакит</a> · <a href="corrections.html">архив уточнений</a> · <a href="o-redakcii.html">редполитика</a> · <a href="dossiers.html">база знаний</a> · <a href="geo.html">география</a> · <a href="rss.xml">RSS</a></p>
 
   <div class="grid">
     <div class="card">
@@ -3421,6 +3423,236 @@ def due_dossier_update(dt, already_sent_today):
     return 0 <= (now_minutes - slot_minutes) <= DOSSIER_WINDOW_MINUTES
 
 
+# --- "Только у федеральных изданий": география новостей ---
+# РИА/ТАСС ведут постоянную региональную разбивку — какие регионы сейчас
+# в фокусе новостей. Бот строит это сам: сопоставляет упомянутые в
+# заголовках/текстах города и регионы со справочником (город → федеральный
+# округ) и копит статистику за последние 7 дней. Намеренно НЕ включены
+# территории со спорным международным статусом (Крым, Донецк, Луганск,
+# Херсон, Запорожье) — присвоение им федерального округа было бы уже не
+# технической, а политической декларацией, а не задачей этой функции.
+RUSSIAN_REGIONS_GAZETTEER = {
+    "москв": ("Москва", "Центральный ФО"),
+    # ФИКС (найдено при проверке качества — "тул" совпадал внутри слова
+    # "стул"/"туловище"): используем более специфичный стем "тульск"
+    # (Тульская область) вместо голого "тул" — теряем редкие упоминания
+    # вида "в Туле", зато исключаем частые ложные срабатывания на бытовых
+    # словах.
+    "тульск": ("Тула", "Центральный ФО"),
+    "рязан": ("Рязань", "Центральный ФО"),
+    "ярослав": ("Ярославль", "Центральный ФО"),
+    # ФИКС: "владимир" — это ОБЩЕЕ ИМЯ (Владимир Путин упоминается в
+    # новостях постоянно), а не только город. Голый стем "владимир"
+    # приписывал Владимирской области любую новость про президента.
+    # "владимирск" (Владимирская область) не совпадает с именем.
+    "владимирск": ("Владимир", "Центральный ФО"),
+    # ФИКС: "твер" совпадал внутри "твёрдый/твердое" и т.п. — используем
+    # "тверск" (Тверская область).
+    "тверск": ("Тверь", "Центральный ФО"),
+    "смолен": ("Смоленск", "Центральный ФО"),
+    "брянск": ("Брянск", "Центральный ФО"),
+    # ФИКС: "орел" совпадал с "орёл/орел" как птицей/гербовым символом
+    # (двуглавый орёл на гербе России упоминается в новостях регулярно).
+    # "орловск" (Орловская область) специфичен и с птицей не совпадает.
+    "орловск": ("Орёл", "Центральный ФО"),
+    "липецк": ("Липецк", "Центральный ФО"),
+    "тамбов": ("Тамбов", "Центральный ФО"),
+    "воронеж": ("Воронеж", "Центральный ФО"),
+    "курск": ("Курск", "Центральный ФО"),
+    "белгород": ("Белгород", "Центральный ФО"),
+    # ФИКС: "иванов" — одна из самых частых русских фамилий; используем
+    # "иваново" (город/область), которое с фамилией не совпадает.
+    "иваново": ("Иваново", "Центральный ФО"),
+    "кострома": ("Кострома", "Центральный ФО"),
+    "калуг": ("Калуга", "Центральный ФО"),
+    # Северо-Западный ФО
+    "петербург": ("Санкт-Петербург", "Северо-Западный ФО"),
+    "мурманск": ("Мурманск", "Северо-Западный ФО"),
+    "архангель": ("Архангельск", "Северо-Западный ФО"),
+    "калинингр": ("Калининград", "Северо-Западный ФО"),
+    "вологд": ("Вологда", "Северо-Западный ФО"),
+    "псков": ("Псков", "Северо-Западный ФО"),
+    "новгород": ("Новгород", "Северо-Западный ФО"),
+    "карели": ("Карелия", "Северо-Западный ФО"),
+    # ФИКС: убрана "коми" — стем совпадал внутри слов "комитет",
+    # "комиссия" (Следственный комитет — одно из самых частых
+    # словосочетаний в криминальных новостях). Надёжного специфичного
+    # варианта для этого короткого топонима нет, поэтому регион
+    # временно исключён из справочника — лучше не отслеживать его
+    # вовсе, чем систематически приписывать ему чужие новости.
+    # Южный ФО
+    "ростов": ("Ростов-на-Дону", "Южный ФО"),
+    "краснодар": ("Краснодар", "Южный ФО"),
+    "сочи": ("Сочи", "Южный ФО"),
+    "волгоград": ("Волгоград", "Южный ФО"),
+    "астрахан": ("Астрахань", "Южный ФО"),
+    "адыге": ("Адыгея", "Южный ФО"),
+    "калмык": ("Калмыкия", "Южный ФО"),
+    # Северо-Кавказский ФО
+    "грозн": ("Грозный", "Северо-Кавказский ФО"),
+    "махачкал": ("Махачкала", "Северо-Кавказский ФО"),
+    "ставропол": ("Ставрополь", "Северо-Кавказский ФО"),
+    "пятигор": ("Пятигорск", "Северо-Кавказский ФО"),
+    "нальчик": ("Нальчик", "Северо-Кавказский ФО"),
+    "владикав": ("Владикавказ", "Северо-Кавказский ФО"),
+    "эльбрус": ("Эльбрус", "Северо-Кавказский ФО"),
+    "ингушет": ("Ингушетия", "Северо-Кавказский ФО"),
+    "карачаев": ("Карачаево-Черкесия", "Северо-Кавказский ФО"),
+    # Приволжский ФО
+    "казан": ("Казань", "Приволжский ФО"),
+    "нижегород": ("Нижний Новгород", "Приволжский ФО"),
+    "самар": ("Самара", "Приволжский ФО"),
+    "уфа": ("Уфа", "Приволжский ФО"),
+    # ФИКС: "перм" совпадал внутри "перманентный" — используем "пермск"
+    # (Пермский край).
+    "пермск": ("Пермь", "Приволжский ФО"),
+    "саратов": ("Саратов", "Приволжский ФО"),
+    "пенз": ("Пенза", "Приволжский ФО"),
+    # ФИКС: "ульянов" — настоящая фамилия Ленина (Владимир Ульянов),
+    # упоминается в исторических/политических статьях. "ульяновск"
+    # специфичен и с фамилией не совпадает.
+    "ульяновск": ("Ульяновск", "Приволжский ФО"),
+    "киров": ("Киров", "Приволжский ФО"),
+    "ижевск": ("Ижевск", "Приволжский ФО"),
+    "удмурт": ("Удмуртия", "Приволжский ФО"),
+    "чуваш": ("Чувашия", "Приволжский ФО"),
+    "мордов": ("Мордовия", "Приволжский ФО"),
+    "оренбург": ("Оренбург", "Приволжский ФО"),
+    # Уральский ФО
+    "екатеринбург": ("Екатеринбург", "Уральский ФО"),
+    "челябинск": ("Челябинск", "Уральский ФО"),
+    "тюмен": ("Тюмень", "Уральский ФО"),
+    "курган": ("Курган", "Уральский ФО"),
+    "югра": ("Югра (ХМАО)", "Уральский ФО"),
+    # Сибирский ФО
+    "новосибир": ("Новосибирск", "Сибирский ФО"),
+    "красноярск": ("Красноярск", "Сибирский ФО"),
+    "омск": ("Омск", "Сибирский ФО"),
+    "иркутск": ("Иркутск", "Сибирский ФО"),
+    "барнаул": ("Барнаул", "Сибирский ФО"),
+    "кемеров": ("Кемерово", "Сибирский ФО"),
+    "томск": ("Томск", "Сибирский ФО"),
+    "тыва": ("Тыва", "Сибирский ФО"),
+    "хакас": ("Хакасия", "Сибирский ФО"),
+    # Дальневосточный ФО
+    "владивосток": ("Владивосток", "Дальневосточный ФО"),
+    "хабаровск": ("Хабаровск", "Дальневосточный ФО"),
+    "якутск": ("Якутск", "Дальневосточный ФО"),
+    "сахалин": ("Сахалин", "Дальневосточный ФО"),
+    "камчатк": ("Камчатка", "Дальневосточный ФО"),
+    "приморь": ("Приморье", "Дальневосточный ФО"),
+    "магадан": ("Магадан", "Дальневосточный ФО"),
+    "бурят": ("Бурятия", "Дальневосточный ФО"),
+    "забайкал": ("Забайкалье", "Дальневосточный ФО"),
+    # Известные оставшиеся ограничения (сознательно не устранялись —
+    # частота столкновений заметно ниже, чем у исправленных выше):
+    # "киров" может редко совпасть с историческим деятелем С. Кировым
+    # или "Кировским районом" другого города; "казан" — с бытовым
+    # словом "казан" (котёл); "курган" — с археологическим "курганом"
+    # (древнее захоронение). Полностью устранить это без разбора текста
+    # по контексту (кто/что упомянуто) невозможно — статистика по этим
+    # трём регионам может содержать небольшую примесь.
+}
+
+
+def extract_mentioned_regions(text):
+    if not text:
+        return set()
+    t = text.lower()
+    found = set()
+    for stem in RUSSIAN_REGIONS_GAZETTEER:
+        # Ищем стем как часть слова (учитывает падежные окончания:
+        # "москве", "москвы", "московской" всё равно содержат "москв").
+        if stem in t:
+            found.add(stem)
+    return found
+
+
+def build_geo_distribution(recent_posts, lookback_days=GEO_LOOKBACK_DAYS):
+    now = time.time()
+    city_counts = {}
+    district_counts = {}
+    for post in recent_posts:
+        ts = post.get("ts")
+        if ts and now - ts > lookback_days * 24 * 3600:
+            continue
+        text = (post.get("headline", "") or "") + " " + (post.get("summary", "") or "")
+        for stem in extract_mentioned_regions(text):
+            display_name, district = RUSSIAN_REGIONS_GAZETTEER[stem]
+            city_counts[display_name] = city_counts.get(display_name, 0) + 1
+            district_counts[district] = district_counts.get(district, 0) + 1
+    return {
+        "cities": dict(sorted(city_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "districts": dict(sorted(district_counts.items(), key=lambda kv: kv[1], reverse=True)),
+    }
+
+
+def build_geo_page(geo_data, generated_at_msk):
+    cities = geo_data.get("cities", {})
+    districts = geo_data.get("districts", {})
+    max_city_count = max(cities.values()) if cities else 1
+    max_district_count = max(districts.values()) if districts else 1
+
+    district_rows = "".join(
+        f'<div class="bar-row"><span class="bar-label">{html.escape(d)}</span>'
+        f'<div class="bar-track"><div class="bar-fill" style="width:{count/max_district_count*100:.0f}%"></div></div>'
+        f'<span class="bar-count">{count}</span></div>'
+        for d, count in districts.items()
+    ) if districts else '<p style="color:#8b96a5">За последнюю неделю упоминания регионов не найдены.</p>'
+
+    city_rows = "".join(
+        f'<li>{html.escape(city)} <span style="color:#8b96a5">— {count} упоминаний</span></li>'
+        for city, count in list(cities.items())[:20]
+    ) if cities else '<li style="color:#8b96a5">Пока нет данных</li>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(CHANNEL_USERNAME)} — география новостей</title>
+<style>
+  body {{ margin:0; padding:40px 20px 64px; background:#0a0e14; color:#eef2f6;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  .wrap {{ max-width:820px; margin:0 auto; }}
+  h1 {{ font-size:1.6rem; }}
+  p.subtitle {{ color:#8b96a5; }}
+  .card {{ background:rgba(22,29,39,0.6); border:1px solid rgba(255,255,255,0.08); border-radius:16px;
+    padding:22px 24px; margin-top:20px; backdrop-filter: blur(14px); }}
+  .bar-row {{ display:flex; align-items:center; gap:10px; margin:12px 0; }}
+  .bar-label {{ width:180px; font-size:0.9rem; color:#c7d0da; flex-shrink:0; }}
+  .bar-track {{ flex:1; background:rgba(255,255,255,0.06); border-radius:8px; height:12px; overflow:hidden; }}
+  .bar-fill {{ background:linear-gradient(90deg,#7c5cff,#4fd1c5); height:100%; border-radius:8px;
+    box-shadow:0 0 12px rgba(79,209,197,0.5); }}
+  .bar-count {{ width:36px; text-align:right; font-size:0.85rem; color:#8b96a5; }}
+  ul {{ list-style:none; padding:0; }}
+  li {{ padding:9px 0; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.92rem; }}
+  a {{ color:#4fd1c5; text-decoration:none; }}
+  footer {{ color:#8b96a5; font-size:0.8rem; margin-top:32px; text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🗺 География новостей</h1>
+  <p class="subtitle">Автоматическая региональная разбивка за последние {GEO_LOOKBACK_DAYS} дней —
+  какие регионы России сейчас в фокусе публикаций канала. · <a href="index.html">← Дашборд</a></p>
+
+  <div class="card">
+    <div style="color:#8b96a5; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.05em;">По федеральным округам</div>
+    {district_rows}
+  </div>
+
+  <div class="card">
+    <div style="color:#8b96a5; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px;">Топ городов и регионов</div>
+    <ul>{city_rows}</ul>
+  </div>
+
+  <footer>Формируется автоматически · последнее обновление: {html.escape(generated_at_msk)} мск</footer>
+</div>
+</body>
+</html>"""
+
+
 STATE_FILES = [
     POSTED_FILE, RECENT_TITLES_FILE, LAST_RUN_FILE, MILESTONES_FILE,
     DIGEST_STATE_FILE, POLL_STATE_FILE,
@@ -3430,7 +3662,7 @@ STATE_FILES = [
     FEEDS_FILE, FEEDS_BACKUP_FILE, SELF_HEAL_LOG_FILE,
     MEDIA_KIT_FILE, CHANNEL_VIEWS_FILE,
     RSS_FEED_FILE, CORRECTIONS_LOG_FILE, CORRECTIONS_PAGE_FILE, EDITORIAL_POLICY_PAGE_FILE,
-    ENTITY_INDEX_FILE, DOSSIERS_INDEX_FILE, DOSSIER_STATE_FILE,
+    ENTITY_INDEX_FILE, DOSSIERS_INDEX_FILE, DOSSIER_STATE_FILE, GEO_PAGE_FILE,
 ]
 
 
@@ -3704,6 +3936,10 @@ def persist_state_to_git(new_posted_ids=None, new_title_words_list=None, new_las
                     entity_page_path = os.path.join(DOSSIERS_DIR, f"{_entity_slug(stem)}.html")
                     with open(entity_page_path, "w", encoding="utf-8") as f:
                         f.write(build_entity_page(stem, entry, generated_label))
+
+                geo_data = build_geo_distribution(merged_recent_posts)
+                with open(GEO_PAGE_FILE, "w", encoding="utf-8") as f:
+                    f.write(build_geo_page(geo_data, generated_label))
             except Exception as e:
                 print(f"[WARN] build_dashboard_html error: {e}")
 
