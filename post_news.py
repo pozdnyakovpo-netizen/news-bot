@@ -689,12 +689,25 @@ STORY_CONTINUATION_WINDOW_HOURS = 48
 
 def find_story_continuation(candidate_title, candidate_summary, recent_posts,
                              hours=STORY_CONTINUATION_WINDOW_HOURS, exclude_entities=None):
+    # ФИКС (жалоба: "продолжение истории возвращается к совершенно другим
+    # новостям"): раньше связь искалась ПО ЕДИНСТВЕННОМУ совпавшему
+    # именному стему (первые 6 букв слова) БЕЗ какой-либо дополнительной
+    # проверки — а стем это грубая эвристика: "Донецк" и "Донецкая
+    # область", "Иванов" и "Иванова" дают один и тот же обрубок "донецк"/
+    # "иванов", хотя это разные сущности. Функция дедупа (is_same_event)
+    # всегда требует ЕЩЁ и реального пересечения слов темы в подкрепление
+    # совпавшей сущности — у "продолжения истории" такой защиты не было
+    # вовсе. Теперь требуем то же самое: совпавшая сущность — необходимое,
+    # но не достаточное условие, плюс минимальное пересечение общих слов
+    # заголовка/текста (тот же порог 0.15, что и в is_same_event).
     exclude_entities = exclude_entities or set()
     c_entities = (extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)) - exclude_entities
     if not c_entities:
         return None
+    c_words = content_words(candidate_title, candidate_summary)
     now = time.time()
     best = None
+    best_ts = -1
     for post in recent_posts:
         if not post.get("message_id"):
             continue
@@ -702,8 +715,14 @@ def find_story_continuation(candidate_title, candidate_summary, recent_posts,
         if ts and now - ts > hours * 3600:
             continue
         p_entities = (extract_entity_stems(post.get("headline", "")) | extract_entity_stems(post.get("summary", ""))) - exclude_entities
-        if c_entities & p_entities:
+        if not (c_entities & p_entities):
+            continue
+        p_words = content_words(post.get("headline", ""), post.get("summary", ""))
+        if not titles_are_similar(c_words, p_words, threshold=0.15):
+            continue
+        if (ts or 0) >= best_ts:
             best = post
+            best_ts = ts or 0
     return best
 
 
@@ -722,17 +741,33 @@ def save_live_threads(threads):
 
 
 def find_active_live_thread(candidate_title, candidate_summary, threads, exclude_entities=None):
+    # ФИКС (жалоба: "закреплённые новости цепляет все новости подряд") —
+    # та же причина и то же решение, что и в find_story_continuation выше:
+    # совпадение ОДНОГО именного стема (обрубок в 6 букв) — это не
+    # достаточное доказательство того, что новость про то же самое
+    # событие. Добавлена обязательная проверка пересечения слов темы
+    # (заголовок эфира + текст всех его обновлений) в подкрепление
+    # совпавшей сущности — иначе бы эфир мог "поглотить" любую новость,
+    # где случайно встретился похожий обрубок слова.
     exclude_entities = exclude_entities or set()
-    now = time.time()
     c_entities = (extract_entity_stems(candidate_title) | extract_entity_stems(candidate_summary)) - exclude_entities
     if not c_entities:
         return None
+    c_words = content_words(candidate_title, candidate_summary)
+    now = time.time()
     for thread in threads:
         if now - thread.get("last_update_ts", 0) > LIVE_STORY_MAX_AGE_HOURS * 3600:
             continue
         t_entities = set(thread.get("entities", [])) - exclude_entities
-        if c_entities & t_entities:
-            return thread
+        if not (c_entities & t_entities):
+            continue
+        thread_text = thread.get("headline", "") + " " + " ".join(
+            u.get("text", "") for u in thread.get("updates", [])
+        )
+        t_words = significant_title_words(thread_text)
+        if not titles_are_similar(c_words, t_words, threshold=0.15):
+            continue
+        return thread
     return None
 
 
